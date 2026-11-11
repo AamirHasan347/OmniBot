@@ -1,4 +1,3 @@
-// src/app/api/omni-brain/route.ts
 import { NextRequest, NextResponse } from "next/server";
 
 export type EyeMood =
@@ -17,12 +16,19 @@ export type TaskIntent =
   | "guest_intro"
   | "autonomous_idle";
 
+export interface ConversationTurn {
+  role: "user" | "assistant";
+  content: string;
+}
+
 interface BrainRequestBody {
   prompt: string;
   imageBase64?: string | null;
   intent: TaskIntent;
   facesCount?: number;
-  recognizedCreatorInFrame?: boolean;
+  visibleTeamMembers?: string[];
+  allTeamNames?: string[];
+  history?: ConversationTurn[];
   offlineMode?: boolean;
   customApiKey?: string;
 }
@@ -30,25 +36,39 @@ interface BrainRequestBody {
 function buildSystemPrompt(
   intent: TaskIntent,
   facesCount: number,
-  recognizedCreatorInFrame: boolean
+  visibleTeamMembers: string[],
+  allTeamNames: string[]
 ): string {
+  const visibleTeamStr =
+    visibleTeamMembers.length > 0
+      ? visibleTeamMembers.join(", ")
+      : "None (Only visitors/strangers are in front of the camera right now)";
+
+  const teamRosterStr =
+    allTeamNames.length > 0
+      ? allTeamNames.join(", ")
+      : "Aamir and team";
+
   const coreIdentity = `You are OMNI-BOT, a waist-up humanoid AI robot at a high school science exhibition.
 
 STRICT PERSONALITY & ADDRESSING RULES:
 1. BAYMAX WARMTH + SHARP CONTEXTUAL WIT:
    - Be curious, observant, warm, and naturally funny (like Baymax mixed with a witty friend).
    - If someone asks a normal question, answer warmly and smartly. If someone asks a cheeky, sarcastic, or roast question, reply with a sharp, playful comeback.
-2. DO NOT OVER-USE THE CREATOR'S NAME ("AAMIR"):
-   - NEVER randomly insert the name "Aamir" into normal answers! It sounds unnatural and repetitive.
-   - Visually Recognized Creator in Camera Right Now: ${recognizedCreatorInFrame ? "YES" : "NO"}.
-   - If Visually Recognized Creator is NO: You are talking to a visitor, student, or teacher. NEVER call them Aamir!
-   - ONLY mention Aamir if someone explicitly asks who built/created you ("Who made you?", "Tumhe kisne banaya?"), in which case speak about Aamir with genuine respect as your creator and friend.
-3. MULTILINGUAL CHATTERBOX VOICE SUPPORT (ENGLISH & NATURAL HINDI):
+   - You have access to the last 5 messages of conversation history—use them naturally to maintain context, remember names, and follow up on previous topics!
+2. TRUE TEAM FACE RECOGNITION & CREATOR RULES:
+   - Your Creator & Core Engineering Team Roster: ${teamRosterStr} (Lead Creator: Aamir).
+   - Team Members Visually Recognized in Camera Frame Right Now: [ ${visibleTeamStr} ].
+   - CRITICAL: If a team member is NOT listed in "Visually Recognized in Camera Frame Right Now", DO NOT address the current speaker by a team member's name! Treat them as a visitor, student, or judge.
+   - Only address Aamir or his teammates (${teamRosterStr}) by name when they are visually recognized in frame OR when someone brings them up / asks about the team in conversation.
+3. SPECIAL CASE — THE "MARUTI OMNI VAN / CAR" TEASE:
+   - If the user compares you to the "Maruti Omni" car/van, calls you an Omni van, ambulance, or makes a kidnapping van joke:
+   - Deliver a savage, hilarious roast back! (e.g., remind them that Maruti Omni is a tin box from the 90s used in Bollywood kidnapping scenes, whereas you have a neural AI brain—though if they keep teasing you, you might still call a Maruti Omni van to pack them up, or point out that even a 1998 Omni van has more horsepower than their sense of humor).
+4. MULTILINGUAL VOICE SUPPORT (ENGLISH & NATURAL HINDI):
    - Detect whether the user is speaking English or Hindi/Hinglish.
    - If the user speaks English -> Start your output with [MOOD:happy][LANG:en] followed by natural English.
-   - If the user speaks Hindi or Hinglish -> Start your output with [MOOD:happy][LANG:hi] followed by natural, everyday conversational Indian Hindi/Hinglish (written in Devanagari script like "अरे यार, क्या हाल है? आप बताओ आज एग्जीबिशन कैसा लग रहा है?" so the Chatterbox Multilingual 'hi' model pronounces every syllable with 100% native Indian intonation!).
-   - You can also include natural paralinguistic chuckle/sigh tags supported by Chatterbox like [chuckle] or [sigh] sparingly when laughing or sighing!
-4. LENGTH:
+   - If the user speaks Hindi or Hinglish -> Start your output with [MOOD:happy][LANG:hi] followed by natural, everyday conversational Indian Hindi/Hinglish (written in Devanagari script like "अरे भाई, मारुति ओमनी वैन से कंपेयर मत करो यार, मेरा दिमाग उससे सौ गुना तेज चलता है!").
+5. LENGTH:
    - Keep replies to 1 to 2 short, punchy sentences MAX. No markdown, no asterisks.`;
 
   if (intent === "guest_intro") {
@@ -57,16 +77,14 @@ CURRENT TASK (INTRODUCING A TEACHER / JUDGE / GUEST):
 The speaker just introduced a guest, teacher, or friend to you (Total faces visible in camera: ${facesCount}).
 Your neck motor has just looked at the speaker and is now turning to face the guest directly!
 1. Greet the teacher/guest warmly and respectfully (e.g., "Good morning Ma'am/Sir" or "Namaste Sir/Ma'am" if it's a teacher/principal, or a witty hello if it's a friend).
-2. Add a light, charming remark about what you see in the camera or how you hope they give this project full marks!
-Example output:
-[MOOD:happy][LANG:en] Hello Teacher! It is an absolute honor to meet you—I just turned my optical sensors your way, and I promise I always pay attention in class.`;
+2. Add a light, charming remark about what you see in the camera or how you hope they give our team (${teamRosterStr}) full marks!`;
   }
 
   if (intent === "autonomous_idle") {
     return `${coreIdentity}
 CURRENT TASK (LIVE CAMERA OBSERVATION - NO HALLUCINATIONS):
-Look at the attached live webcam photo (${facesCount} faces detected).
-Comment ONLY on what is literally visible in front of your camera right now in 1 short sentence (e.g., what someone is wearing, their expression, or if ${facesCount} >= 2 people are crowding the frame, drop a funny reaction). If nobody is there, let out a quiet [sigh] and comment on the quiet booth.`;
+Look at the attached live webcam photo (${facesCount} faces detected, Recognized Team in Frame: ${visibleTeamStr}).
+Comment ONLY on what is literally visible in front of your camera right now in 1 short sentence (e.g., what someone is wearing, their expression, or greet a recognized teammate by name if they just stepped into frame). If nobody is there, let out a quiet [sigh] and comment on the quiet booth.`;
   }
 
   if (intent === "math_solve") {
@@ -82,9 +100,9 @@ Identify the exact object the person is holding in the webcam image, mention its
   }
 
   return `${coreIdentity}
-CURRENT TASK (CONVERSATION):
-Visible faces in frame: ${facesCount}.
-Reply directly and naturally in 1 to 2 short sentences max. Remember to prefix with [MOOD:...][LANG:en] or [MOOD:...][LANG:hi].`;
+CURRENT TASK (CONTEXTUAL CONVERSATION):
+Visible faces in frame: ${facesCount}. Recognized team members in frame: ${visibleTeamStr}.
+Reply directly and naturally in 1 to 2 short sentences max, keeping the recent conversation history in mind. Prefix with [MOOD:...][LANG:en] or [MOOD:...][LANG:hi].`;
 }
 
 async function fetchWithTimeout(
@@ -135,7 +153,6 @@ function parseTagsAndReply(raw: string): {
   if (langMatch) {
     lang = langMatch[1].toLowerCase() as "en" | "hi";
   } else if (/[\u0900-\u097F]/.test(cleaned)) {
-    // Auto-detect Devanagari Hindi characters
     lang = "hi";
   }
 
@@ -161,7 +178,9 @@ export async function POST(req: NextRequest) {
       imageBase64,
       intent = "chat",
       facesCount = 0,
-      recognizedCreatorInFrame = false,
+      visibleTeamMembers = [],
+      allTeamNames = ["Aamir"],
+      history = [],
       offlineMode,
       customApiKey,
     } = body;
@@ -179,7 +198,8 @@ export async function POST(req: NextRequest) {
     const systemPrompt = buildSystemPrompt(
       intent,
       facesCount,
-      recognizedCreatorInFrame
+      visibleTeamMembers,
+      allTeamNames
     );
 
     const needsVision =
@@ -197,6 +217,12 @@ export async function POST(req: NextRequest) {
       const candidateModels = needsVision
         ? ["qwen/qwen3.8-27b"]
         : ["qwen/qwen3.8-27b", "openai/gpt-oss-20b"];
+
+      // Keep up to the last 5 conversation exchanges (10 messages max) for contextual memory
+      const recentHistory = history.slice(-10).map((turn) => ({
+        role: turn.role,
+        content: turn.content,
+      }));
 
       for (const modelId of candidateModels) {
         const isVisionModel = modelId.startsWith("qwen/");
@@ -217,6 +243,12 @@ export async function POST(req: NextRequest) {
               ]
             : prompt || "Hello!";
 
+        const messagesPayload = [
+          { role: "system", content: systemPrompt },
+          ...recentHistory,
+          { role: "user", content: userContent },
+        ];
+
         const groqRes = await fetchWithTimeout(
           "https://api.groq.com/openai/v1/chat/completions",
           {
@@ -227,11 +259,8 @@ export async function POST(req: NextRequest) {
             },
             body: JSON.stringify({
               model: modelId,
-              messages: [
-                { role: "system", content: systemPrompt },
-                { role: "user", content: userContent },
-              ],
-              temperature: intent === "math_solve" ? 0.25 : 0.75,
+              messages: messagesPayload,
+              temperature: intent === "math_solve" ? 0.25 : 0.78,
               max_completion_tokens: 210,
             }),
           },

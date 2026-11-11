@@ -35,53 +35,38 @@ interface TrackedFace {
   centerY: number;
   panAngle: number;
   area: number;
-  isOperator: boolean;
+  matchedName: string | null;
 }
 
-// Compute compact spatial signature from face bounding box
-function extractFaceSignature(
-  video: HTMLVideoElement,
-  box: { originX: number; originY: number; width: number; height: number }
-): number[] | null {
-  const canvas = document.createElement("canvas");
-  canvas.width = 16;
-  canvas.height = 16;
-  const ctx = canvas.getContext("2d");
-  if (!ctx) return null;
-
-  ctx.drawImage(
-    video,
-    Math.max(0, box.originX),
-    Math.max(0, box.originY),
-    Math.max(1, box.width),
-    Math.max(1, box.height),
-    0,
-    0,
-    16,
-    16
-  );
-
-  const data = ctx.getImageData(0, 0, 16, 16).data;
-  const bins = new Array(12).fill(0);
-
-  for (let i = 0; i < 256; i++) {
-    const region = Math.min(3, Math.floor(i / 64));
-    bins[region * 3 + 0] += data[i * 4 + 0] / 255;
-    bins[region * 3 + 1] += data[i * 4 + 1] / 255;
-    bins[region * 3 + 2] += data[i * 4 + 2] / 255;
-  }
-
-  return bins.map((v) => v / 64);
+interface TeamMemberProfile {
+  id: string;
+  name: string;
+  role: string;
+  descriptor: number[] | null;
 }
 
-function compareFaceSignatures(sigA: number[], sigB: number[]): number {
-  if (sigA.length !== sigB.length) return 0;
-  let diffSum = 0;
-  for (let i = 0; i < sigA.length; i++) {
-    diffSum += Math.abs(sigA[i] - sigB[i]);
+const DEFAULT_TEAM_ROSTER: TeamMemberProfile[] = [
+  { id: "member-1", name: "Aamir", role: "Lead Creator", descriptor: null },
+  { id: "member-2", name: "Teammate 2", role: "Team Member", descriptor: null },
+  { id: "member-3", name: "Teammate 3", role: "Team Member", descriptor: null },
+  { id: "member-4", name: "Teammate 4", role: "Team Member", descriptor: null },
+  { id: "member-5", name: "Teammate 5", role: "Team Member", descriptor: null },
+];
+
+// Euclidean distance between two 128-D face-api descriptors (< 0.52 is a strong biometric match)
+function euclideanDistance128(
+  descA: number[],
+  descB: Float32Array | number[]
+): number {
+  if (descA.length !== descB.length) return 999;
+  let sum = 0;
+  for (let i = 0; i < descA.length; i++) {
+    const valA = descA[i] ?? 0;
+    const valB = descB[i] ?? 0;
+    const d = valA - valB;
+    sum += d * d;
   }
-  const avgDiff = diffSum / sigA.length;
-  return Math.max(0, Math.min(1, 1 - avgDiff * 2.8));
+  return Math.sqrt(sum);
 }
 
 function parsePhysicalVoiceReflex(transcript: string): {
@@ -226,6 +211,9 @@ function detectUserIntent(text: string): TaskIntent {
 }
 
 export default function OmniBotMissionControl() {
+  // ---------------------------------------------------------------------------
+  // 1. CONNECTION, TELEMETRY & TEAM ROSTER STATE
+  // ---------------------------------------------------------------------------
   const [wsUrl, setWsUrl] = useState<string>(
     process.env.NEXT_PUBLIC_ESP32_WS_URL || "ws://192.168.10.44:81"
   );
@@ -234,7 +222,7 @@ export default function OmniBotMissionControl() {
   );
   const [wsConnected, setWsConnected] = useState<boolean>(false);
   const [ttsEngineStatus, setTtsEngineStatus] = useState<string>(
-    "Chatterbox Local (4123)"
+    "Neural TTS (4123)"
   );
   const [showDebugDrawer, setShowDebugDrawer] = useState<boolean>(false);
   const [customApiKey, setCustomApiKey] = useState<string>("");
@@ -248,24 +236,36 @@ export default function OmniBotMissionControl() {
     '{"pan":90,"mood":"normal","volume":0}'
   );
   const [lastAiLatency, setLastAiLatency] = useState<number>(0);
-  const [operatorEnrolled, setOperatorEnrolled] = useState<boolean>(false);
-  const [operatorDetectedNow, setOperatorDetectedNow] =
-    useState<boolean>(false);
 
+  // 5-Member Biometric Face ID Roster
+  const [teamRoster, setTeamRoster] =
+    useState<TeamMemberProfile[]>(DEFAULT_TEAM_ROSTER);
+  const [faceIdModelReady, setFaceIdModelReady] = useState<boolean>(false);
+  const [visibleTeamNames, setVisibleTeamNames] = useState<string[]>([]);
+  const [enrollingSlotIdx, setEnrollingSlotIdx] = useState<number | null>(null);
+
+  // Behavior Toggles
   const [autoTrackFace, setAutoTrackFace] = useState<boolean>(true);
   const [passiveLifeHabits, setPassiveLifeHabits] = useState<boolean>(true);
+  const [crowdControlEnabled, setCrowdControlEnabled] = useState<boolean>(true);
   const [spontaneousMonologue, setSpontaneousMonologue] =
     useState<boolean>(false);
   const [alwaysOnMic, setAlwaysOnMic] = useState<boolean>(true);
   const [invertPanDirection, setInvertPanDirection] = useState<boolean>(false);
   const [offlineMode, setOfflineMode] = useState<boolean>(false);
 
+  // ---------------------------------------------------------------------------
+  // 2. A/V DEVICES
+  // ---------------------------------------------------------------------------
   const [videoDevices, setVideoDevices] = useState<MediaDeviceInfo[]>([]);
   const [audioInDevices, setAudioInDevices] = useState<MediaDeviceInfo[]>([]);
   const [micLang, setMicLang] = useState<"en-IN" | "hi-IN">("en-IN");
   const [selectedVideoId, setSelectedVideoId] = useState<string>("");
   const [selectedMicId, setSelectedMicId] = useState<string>("");
 
+  // ---------------------------------------------------------------------------
+  // 3. VISION, MIC & AI PIPELINE STATE
+  // ---------------------------------------------------------------------------
   const [visionReady, setVisionReady] = useState<boolean>(false);
   const [fps, setFps] = useState<number>(0);
   const [facesDetected, setFacesDetected] = useState<number>(0);
@@ -285,28 +285,30 @@ export default function OmniBotMissionControl() {
     {
       id: "init-1",
       sender: "OMNI-BOT",
-      text: "Systems online. Local Chatterbox Multilingual TTS ready on port 4123.",
+      text: "Systems online! 5-Turn Contextual Memory, 5-Member Neural Face ID, and >4 Person Crowd Control are active.",
       mood: "normal",
       intent: "chat",
       timestamp: "READY",
     },
   ]);
 
+  // ---------------------------------------------------------------------------
+  // 4. MUTABLE REFS
+  // ---------------------------------------------------------------------------
   const wsRef = useRef<WebSocket | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const hudCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const faceDetectorRef = useRef<FaceDetector | null>(null);
+  const faceApiRef = useRef<any>(null);
   const activeAudioRef = useRef<HTMLAudioElement | null>(null);
 
-  const operatorSignatureRef = useRef<number[] | null>(null);
-  const latestPrimaryBoxRef = useRef<{
-    originX: number;
-    originY: number;
-    width: number;
-    height: number;
-  } | null>(null);
+  const teamRosterRef = useRef<TeamMemberProfile[]>(DEFAULT_TEAM_ROSTER);
+  const recognizedSpatialRef = useRef<Array<{ normX: number; name: string }>>(
+    []
+  );
+  const visibleTeamNamesRef = useRef<string[]>([]);
   const trackedFacesRef = useRef<TrackedFace[]>([]);
-  const operatorInFrameRef = useRef<boolean>(false);
+  const chatLogsRef = useRef<ChatLog[]>([]);
 
   const telemetryRef = useRef<{ pan: number; mood: EyeMood; volume: number }>({
     pan: 90,
@@ -322,9 +324,12 @@ export default function OmniBotMissionControl() {
   const autoTrackRef = useRef<boolean>(true);
   const invertPanRef = useRef<boolean>(false);
   const alwaysOnMicRef = useRef<boolean>(true);
+  const crowdControlEnabledRef = useRef<boolean>(true);
   const isSpeakingRef = useRef<boolean>(false);
   const isThinkingRef = useRef<boolean>(false);
   const manualNeckHoldUntilRef = useRef<number>(0);
+  const lastCrowdAlertMsRef = useRef<number>(0);
+  const crowdOverloadStartMsRef = useRef<number>(0);
 
   const facesCountRef = useRef<number>(0);
   const lastInteractionMsRef = useRef<number>(0);
@@ -334,15 +339,26 @@ export default function OmniBotMissionControl() {
   const micStreamRef = useRef<MediaStream | null>(null);
 
   useEffect(() => {
+    chatLogsRef.current = chatLogs;
+  }, [chatLogs]);
+
+  useEffect(() => {
+    teamRosterRef.current = teamRoster;
+  }, [teamRoster]);
+
+  useEffect(() => {
     lastInteractionMsRef.current = Date.now();
     try {
-      const savedSig = localStorage.getItem("omnibot_operator_face_sig");
-      if (savedSig) {
-        operatorSignatureRef.current = JSON.parse(savedSig);
-        setOperatorEnrolled(true);
+      const savedRoster = localStorage.getItem("omnibot_team_roster_v2");
+      if (savedRoster) {
+        const parsed = JSON.parse(savedRoster) as TeamMemberProfile[];
+        if (Array.isArray(parsed) && parsed.length === 5) {
+          setTeamRoster(parsed);
+          teamRosterRef.current = parsed;
+        }
       }
     } catch {
-      // Ignore
+      // Ignore storage error
     }
   }, []);
 
@@ -358,37 +374,229 @@ export default function OmniBotMissionControl() {
     alwaysOnMicRef.current = alwaysOnMic;
   }, [alwaysOnMic]);
 
-  const enrollOperatorFace = useCallback(() => {
+  useEffect(() => {
+    crowdControlEnabledRef.current = crowdControlEnabled;
+  }, [crowdControlEnabled]);
+
+  // ---------------------------------------------------------------------------
+  // 5. LOAD 128-D NEURAL FACE RECOGNITION MODELS (@vladmandic/face-api)
+  // ---------------------------------------------------------------------------
+  useEffect(() => {
+    let isMounted = true;
+    async function initFaceIdModels() {
+      try {
+        const faceapi = await import("@vladmandic/face-api");
+        const MODEL_URL =
+          "https://cdn.jsdelivr.net/npm/@vladmandic/face-api/model/";
+        await Promise.all([
+          faceapi.nets.tinyFaceDetector.loadFromUri(MODEL_URL),
+          faceapi.nets.faceLandmark68TinyNet.loadFromUri(MODEL_URL),
+          faceapi.nets.faceRecognitionNet.loadFromUri(MODEL_URL),
+        ]);
+        if (isMounted) {
+          faceApiRef.current = faceapi;
+          setFaceIdModelReady(true);
+        }
+      } catch (err) {
+        console.error("Failed to load 128-D Face ID models:", err);
+      }
+    }
+    initFaceIdModels();
+    return () => {
+      isMounted = false;
+    };
+  }, []);
+
+  // Background 128-D Biometric Face Matcher Loop (Every 650ms)
+  useEffect(() => {
+    const interval = setInterval(async () => {
+      const faceapi = faceApiRef.current;
+      const video = videoRef.current;
+      if (!faceapi || !video || video.readyState < 2) return;
+
+      const enrolledMembers = teamRosterRef.current.filter(
+        (m) => m.descriptor !== null && m.descriptor.length === 128
+      );
+      if (enrolledMembers.length === 0) {
+        recognizedSpatialRef.current = [];
+        visibleTeamNamesRef.current = [];
+        setVisibleTeamNames([]);
+        return;
+      }
+
+      try {
+        const detections = await faceapi
+          .detectAllFaces(
+            video,
+            new faceapi.TinyFaceDetectorOptions({
+              inputSize: 224,
+              scoreThreshold: 0.5,
+            })
+          )
+          .withFaceLandmarks(true)
+          .withFaceDescriptors();
+
+        const width = video.videoWidth || 640;
+        const newMatches: Array<{ normX: number; name: string }> = [];
+        const matchedNamesSet = new Set<string>();
+
+        for (const det of detections) {
+          const box = det.detection.box;
+          const normX = (box.x + box.width / 2) / width;
+
+          let bestName: string | null = null;
+          let bestDist = 0.52;
+
+          for (const member of enrolledMembers) {
+            if (!member.descriptor) continue;
+            const dist = euclideanDistance128(
+              member.descriptor,
+              det.descriptor
+            );
+            if (dist < bestDist) {
+              bestDist = dist;
+              bestName = member.name;
+            }
+          }
+
+          if (bestName) {
+            newMatches.push({ normX, name: bestName });
+            matchedNamesSet.add(bestName);
+          }
+        }
+
+        recognizedSpatialRef.current = newMatches;
+        const namesList = Array.from(matchedNamesSet);
+        visibleTeamNamesRef.current = namesList;
+        setVisibleTeamNames(namesList);
+      } catch {
+        // Ignore single frame recognition error
+      }
+    }, 650);
+
+    return () => clearInterval(interval);
+  }, []);
+
+  // Strictly typed .map() state updates so TypeScript never shows red underlines
+  const enrollTeamMemberFace = useCallback(async (slotIndex: number) => {
+    const faceapi = faceApiRef.current;
     const video = videoRef.current;
-    const box = latestPrimaryBoxRef.current;
-    if (!video || !box) {
-      alert("Stand in front of the camera first so your face box is visible!");
+    if (!faceapi || !video || video.readyState < 2) {
+      alert(
+        "Wait a second for the camera and Face ID neural net to finish loading!"
+      );
       return;
     }
-    const sig = extractFaceSignature(video, box);
-    if (sig) {
-      operatorSignatureRef.current = sig;
-      setOperatorEnrolled(true);
+
+    setEnrollingSlotIdx(slotIndex);
+    try {
+      const detection = await faceapi
+        .detectSingleFace(
+          video,
+          new faceapi.TinyFaceDetectorOptions({
+            inputSize: 320,
+            scoreThreshold: 0.5,
+          })
+        )
+        .withFaceLandmarks(true)
+        .withFaceDescriptor();
+
+      if (!detection || !detection.descriptor) {
+        alert(
+          "Could not lock onto a clear face! Look directly at the camera with good lighting and click Enroll again."
+        );
+        setEnrollingSlotIdx(null);
+        return;
+      }
+
+      const rawFloats = detection.descriptor as Float32Array;
+      const descriptorArray: number[] = [];
+      for (let i = 0; i < rawFloats.length; i++) {
+        descriptorArray.push(Number(rawFloats[i] ?? 0));
+      }
+
+      setTeamRoster((prev) => {
+        const updated: TeamMemberProfile[] = prev.map((item, idx) =>
+          idx === slotIndex
+            ? {
+                id: item.id,
+                name: item.name,
+                role: item.role,
+                descriptor: descriptorArray,
+              }
+            : item
+        );
+        teamRosterRef.current = updated;
+        try {
+          localStorage.setItem(
+            "omnibot_team_roster_v2",
+            JSON.stringify(updated)
+          );
+        } catch {
+          // Ignore
+        }
+        return updated;
+      });
+    } catch (err) {
+      console.error("Enrollment error:", err);
+    } finally {
+      setEnrollingSlotIdx(null);
+    }
+  }, []);
+
+  const updateTeamMemberName = useCallback(
+    (slotIndex: number, newName: string) => {
+      setTeamRoster((prev) => {
+        const updated: TeamMemberProfile[] = prev.map((item, idx) =>
+          idx === slotIndex
+            ? {
+                id: item.id,
+                name: newName,
+                role: item.role,
+                descriptor: item.descriptor,
+              }
+            : item
+        );
+        teamRosterRef.current = updated;
+        try {
+          localStorage.setItem(
+            "omnibot_team_roster_v2",
+            JSON.stringify(updated)
+          );
+        } catch {
+          // Ignore
+        }
+        return updated;
+      });
+    },
+    []
+  );
+
+  const clearTeamMemberSlot = useCallback((slotIndex: number) => {
+    setTeamRoster((prev) => {
+      const updated: TeamMemberProfile[] = prev.map((item, idx) =>
+        idx === slotIndex
+          ? {
+              id: item.id,
+              name: item.name,
+              role: item.role,
+              descriptor: null,
+            }
+          : item
+      );
+      teamRosterRef.current = updated;
       try {
-        localStorage.setItem("omnibot_operator_face_sig", JSON.stringify(sig));
+        localStorage.setItem("omnibot_team_roster_v2", JSON.stringify(updated));
       } catch {
         // Ignore
       }
-    }
+      return updated;
+    });
   }, []);
 
-  const clearOperatorEnrollment = useCallback(() => {
-    operatorSignatureRef.current = null;
-    setOperatorEnrolled(false);
-    setOperatorDetectedNow(false);
-    operatorInFrameRef.current = false;
-    try {
-      localStorage.removeItem("omnibot_operator_face_sig");
-    } catch {
-      // Ignore
-    }
-  }, []);
-
+  // ---------------------------------------------------------------------------
+  // 6. ZERO-LAG DELTA WEBSOCKET DISPATCHER
+  // ---------------------------------------------------------------------------
   const sendNowIfChanged = useCallback((force = false) => {
     const ws = wsRef.current;
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
@@ -479,6 +687,9 @@ export default function OmniBotMissionControl() {
     return () => clearInterval(interval);
   }, [sendNowIfChanged]);
 
+  // ---------------------------------------------------------------------------
+  // 7. ENUMERATE CAMERA & MICROPHONE DEVICES
+  // ---------------------------------------------------------------------------
   const refreshDevices = useCallback(async () => {
     try {
       const tempStream = await navigator.mediaDevices.getUserMedia({
@@ -496,11 +707,21 @@ export default function OmniBotMissionControl() {
 
       if (!selectedVideoId && cams.length > 0) {
         const usbCam = cams.find((c) => c.label.toLowerCase().includes("usb"));
-        setSelectedVideoId(usbCam ? usbCam.deviceId : cams[0].deviceId);
+        const firstCam = cams[0];
+        if (usbCam) {
+          setSelectedVideoId(usbCam.deviceId);
+        } else if (firstCam) {
+          setSelectedVideoId(firstCam.deviceId);
+        }
       }
       if (!selectedMicId && mics.length > 0) {
         const usbMic = mics.find((m) => m.label.toLowerCase().includes("usb"));
-        setSelectedMicId(usbMic ? usbMic.deviceId : mics[0].deviceId);
+        const firstMic = mics[0];
+        if (usbMic) {
+          setSelectedMicId(usbMic.deviceId);
+        } else if (firstMic) {
+          setSelectedMicId(firstMic.deviceId);
+        }
       }
     } catch (err) {
       console.error("Device enumeration error:", err);
@@ -537,6 +758,222 @@ export default function OmniBotMissionControl() {
     return () => activeStream?.getTracks().forEach((t) => t.stop());
   }, [selectedVideoId]);
 
+  // ---------------------------------------------------------------------------
+  // 8. LOCAL NEURAL TTS + SPECIAL CROWD CONTROL 2-SECOND PAUSE CHOREOGRAPHY
+  // ---------------------------------------------------------------------------
+  const playSingleTtsSegment = useCallback(
+    async (text: string, mood: EyeMood, lang: "en" | "hi"): Promise<void> => {
+      if (typeof window === "undefined") return;
+
+      updateTelemetry({ mood }, true);
+
+      try {
+        const res = await fetch(chatterboxUrl, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            text,
+            language_id: lang,
+            exaggeration: 0.65,
+            cfg_weight: 0.4,
+          }),
+        });
+
+        if (res.ok) {
+          setTtsEngineStatus(`Neural TTS (${lang.toUpperCase()})`);
+          const blob = await res.blob();
+          const audioUrl = URL.createObjectURL(blob);
+
+          await new Promise<void>((resolve) => {
+            const audio = new Audio(audioUrl);
+            activeAudioRef.current = audio;
+
+            const audioCtx = new AudioContext();
+            const source = audioCtx.createMediaElementSource(audio);
+            const analyser = audioCtx.createAnalyser();
+            analyser.fftSize = 128;
+            source.connect(analyser);
+            analyser.connect(audioCtx.destination);
+            const freqData = new Uint8Array(analyser.frequencyBinCount);
+
+            if (speakingTimerRef.current)
+              clearInterval(speakingTimerRef.current);
+            speakingTimerRef.current = setInterval(() => {
+              analyser.getByteFrequencyData(freqData);
+              let sum = 0;
+              for (let i = 0; i < 24; i++) sum += freqData[i] ?? 0;
+              const avg = sum / 24;
+              const mappedVu = Math.min(16, Math.max(2, Math.round(avg / 10)));
+              updateTelemetry({ volume: mappedVu }, true);
+            }, 55);
+
+            const finishSegment = () => {
+              if (speakingTimerRef.current) {
+                clearInterval(speakingTimerRef.current);
+                speakingTimerRef.current = null;
+              }
+              audioCtx.close().catch(() => {});
+              URL.revokeObjectURL(audioUrl);
+              updateTelemetry({ volume: 0 }, true);
+              resolve();
+            };
+
+            audio.onended = finishSegment;
+            audio.onerror = finishSegment;
+            audio.play().catch(finishSegment);
+          });
+          return;
+        }
+      } catch {
+        setTtsEngineStatus("Browser Fallback");
+      }
+
+      await new Promise<void>((resolve) => {
+        const utterance = new SpeechSynthesisUtterance(text);
+        utterance.lang = lang === "hi" ? "hi-IN" : "en-IN";
+        utterance.rate = 1.05;
+        utterance.pitch = 0.9;
+
+        let tick = 0;
+        if (speakingTimerRef.current) clearInterval(speakingTimerRef.current);
+        speakingTimerRef.current = setInterval(() => {
+          tick++;
+          const wave = Math.abs(Math.sin(tick * 0.45)) * 10 + Math.random() * 5;
+          updateTelemetry(
+            { volume: Math.min(16, Math.max(3, Math.round(wave))) },
+            true
+          );
+        }, 60);
+
+        const done = () => {
+          if (speakingTimerRef.current) {
+            clearInterval(speakingTimerRef.current);
+            speakingTimerRef.current = null;
+          }
+          updateTelemetry({ volume: 0 }, true);
+          resolve();
+        };
+
+        utterance.onend = done;
+        utterance.onerror = done;
+        window.speechSynthesis.speak(utterance);
+      });
+    },
+    [chatterboxUrl, updateTelemetry]
+  );
+
+  const speakWithChatterbox = useCallback(
+    async (text: string, mood: EyeMood, lang: "en" | "hi" = "en") => {
+      try {
+        recognitionRef.current?.stop();
+      } catch {
+        // Ignore
+      }
+
+      if (activeAudioRef.current) {
+        activeAudioRef.current.pause();
+        activeAudioRef.current = null;
+      }
+      if (typeof window !== "undefined" && "speechSynthesis" in window) {
+        window.speechSynthesis.cancel();
+      }
+
+      setIsSpeaking(true);
+      isSpeakingRef.current = true;
+
+      await playSingleTtsSegment(text, mood, lang);
+
+      setIsSpeaking(false);
+      isSpeakingRef.current = false;
+      updateTelemetry({ volume: 0, mood: "normal" }, true);
+
+      if (alwaysOnMicRef.current) {
+        setTimeout(() => {
+          if (!isSpeakingRef.current && !isThinkingRef.current) {
+            try {
+              recognitionRef.current?.start();
+            } catch {
+              // Ignore
+            }
+          }
+        }, 350);
+      }
+    },
+    [playSingleTtsSegment, updateTelemetry]
+  );
+
+  // SPECIAL EVENT: >4 People Crowd Control Choreography
+  const executeCrowdControlAlert = useCallback(async () => {
+    if (isSpeakingRef.current || isThinkingRef.current) return;
+    lastCrowdAlertMsRef.current = Date.now();
+    lastInteractionMsRef.current = Date.now();
+
+    try {
+      recognitionRef.current?.stop();
+    } catch {
+      // Ignore
+    }
+
+    setIsSpeaking(true);
+    isSpeakingRef.current = true;
+    manualNeckHoldUntilRef.current = Date.now() + 9000;
+
+    const faces = trackedFacesRef.current;
+    const primarySpeakerAngle = faces[0]?.panAngle ?? 90;
+    let crowdAngle = primarySpeakerAngle > 90 ? 45 : 135;
+    if (faces.length > 1) {
+      const sideFaces = faces.slice(1);
+      const avgSideAngle =
+        sideFaces.reduce((acc, f) => acc + f.panAngle, 0) / sideFaces.length;
+      crowdAngle = Math.round(avgSideAngle);
+    }
+
+    setChatLogs((prev) => [
+      {
+        id: `crowd-${Date.now()}`,
+        sender: "OMNI-BOT",
+        text: "हाँ आओ ना, घुस जाओ मेरे अंदर! ... [2s Glare] ... हटो सब सामने से!!!",
+        mood: "angry",
+        intent: "chat",
+        latencyMs: 0,
+        timestamp: new Date().toLocaleTimeString(),
+      },
+      ...prev,
+    ]);
+
+    updateTelemetry({ pan: crowdAngle, mood: "suspicious" }, true);
+    await playSingleTtsSegment(
+      "हाँ आओ ना, घुस जाओ मेरे अंदर!",
+      "suspicious",
+      "hi"
+    );
+
+    updateTelemetry({ mood: "angry", volume: 0 }, true);
+    await new Promise((r) => setTimeout(r, 2000));
+
+    await playSingleTtsSegment("हटो सब सामने से!", "angry", "hi");
+
+    updateTelemetry(
+      { pan: primarySpeakerAngle, mood: "normal", volume: 0 },
+      true
+    );
+    setIsSpeaking(false);
+    isSpeakingRef.current = false;
+
+    if (alwaysOnMicRef.current) {
+      setTimeout(() => {
+        try {
+          recognitionRef.current?.start();
+        } catch {
+          // Ignore
+        }
+      }, 350);
+    }
+  }, [playSingleTtsSegment, updateTelemetry]);
+
+  // ---------------------------------------------------------------------------
+  // 9. MEDIAPIPE 60FPS MULTI-FACE TRACKING + >4 CROWD DETECTOR
+  // ---------------------------------------------------------------------------
   useEffect(() => {
     let isMounted = true;
     async function loadMediaPipe() {
@@ -551,7 +988,7 @@ export default function OmniBotMissionControl() {
             delegate: "GPU",
           },
           runningMode: "VIDEO",
-          minDetectionConfidence: 0.55,
+          minDetectionConfidence: 0.52,
         });
         if (isMounted) {
           faceDetectorRef.current = detector;
@@ -605,22 +1042,36 @@ export default function OmniBotMissionControl() {
 
           const result = detector.detectForVideo(video, now);
           const detections = result.detections || [];
-          setFacesDetected(detections.length);
-          facesCountRef.current = detections.length;
+          const count = detections.length;
+          setFacesDetected(count);
+          facesCountRef.current = count;
+
+          if (count >= 5 && crowdControlEnabledRef.current) {
+            if (crowdOverloadStartMsRef.current === 0) {
+              crowdOverloadStartMsRef.current = Date.now();
+            } else if (
+              Date.now() - crowdOverloadStartMsRef.current >= 1200 &&
+              Date.now() - lastCrowdAlertMsRef.current >= 45000 &&
+              !isSpeakingRef.current &&
+              !isThinkingRef.current
+            ) {
+              crowdOverloadStartMsRef.current = 0;
+              executeCrowdControlAlert();
+            }
+          } else {
+            crowdOverloadStartMsRef.current = 0;
+          }
 
           const currentFaces: TrackedFace[] = [];
-          let foundOperatorThisFrame = false;
 
-          if (detections.length > 0) {
+          if (count > 0) {
             const sorted = [...detections].sort((a, b) => {
-              const areaA = (a.boundingBox?.width || 0) * (a.boundingBox?.height || 0);
-              const areaB = (b.boundingBox?.width || 0) * (b.boundingBox?.height || 0);
+              const areaA =
+                (a.boundingBox?.width || 0) * (a.boundingBox?.height || 0);
+              const areaB =
+                (b.boundingBox?.width || 0) * (b.boundingBox?.height || 0);
               return areaB - areaA;
             });
-
-            if (sorted[0].boundingBox) {
-              latestPrimaryBoxRef.current = sorted[0].boundingBox;
-            }
 
             sorted.forEach((det, idx) => {
               const box = det.boundingBox;
@@ -633,18 +1084,11 @@ export default function OmniBotMissionControl() {
                 ? 20 + normalizedX * 140
                 : 160 - normalizedX * 140;
 
-              let isOperator = false;
-              if (operatorSignatureRef.current) {
-                const liveSig = extractFaceSignature(video, box);
-                if (liveSig) {
-                  const similarity = compareFaceSignatures(
-                    operatorSignatureRef.current,
-                    liveSig
-                  );
-                  if (similarity >= 0.82) {
-                    isOperator = true;
-                    foundOperatorThisFrame = true;
-                  }
+              let matchedName: string | null = null;
+              for (const rec of recognizedSpatialRef.current) {
+                if (Math.abs(rec.normX - normalizedX) < 0.14) {
+                  matchedName = rec.name;
+                  break;
                 }
               }
 
@@ -653,10 +1097,10 @@ export default function OmniBotMissionControl() {
                 centerY: faceCenterY,
                 panAngle: mappedAngle,
                 area: box.width * box.height,
-                isOperator,
+                matchedName,
               });
 
-              const color = isOperator
+              const color = matchedName
                 ? "#34d399"
                 : idx === 0
                 ? "#38bdf8"
@@ -667,11 +1111,13 @@ export default function OmniBotMissionControl() {
 
               ctx.fillStyle = color;
               ctx.font = "bold 11px monospace";
-              const tagLabel = isOperator
-                ? `CREATOR RECOGNIZED • ${Math.round(mappedAngle)}°`
+              const tagLabel = matchedName
+                ? `TEAM: ${matchedName.toUpperCase()} • ${Math.round(
+                    mappedAngle
+                  )}°`
                 : idx === 0
-                ? `SUBJECT #1 • ${Math.round(mappedAngle)}°`
-                : `GUEST #${idx + 1} • ${Math.round(mappedAngle)}°`;
+                ? `SPEAKER #1 • ${Math.round(mappedAngle)}°`
+                : `CROWD #${idx + 1} • ${Math.round(mappedAngle)}°`;
 
               ctx.fillText(
                 tagLabel,
@@ -684,18 +1130,17 @@ export default function OmniBotMissionControl() {
               ctx.fill();
             });
 
+            const firstFace = currentFaces[0];
             if (
               autoTrackRef.current &&
               Date.now() > manualNeckHoldUntilRef.current &&
-              currentFaces.length > 0
+              firstFace
             ) {
-              updateTelemetry({ pan: currentFaces[0].panAngle });
+              updateTelemetry({ pan: firstFace.panAngle });
             }
           }
 
           trackedFacesRef.current = currentFaces;
-          operatorInFrameRef.current = foundOperatorThisFrame;
-          setOperatorDetectedNow(foundOperatorThisFrame);
         }
       }
       animFrameId = requestAnimationFrame(renderVisionLoop);
@@ -703,8 +1148,11 @@ export default function OmniBotMissionControl() {
 
     animFrameId = requestAnimationFrame(renderVisionLoop);
     return () => cancelAnimationFrame(animFrameId);
-  }, [updateTelemetry]);
+  }, [executeCrowdControlAlert, updateTelemetry]);
 
+  // ---------------------------------------------------------------------------
+  // 10. PASSIVE "ALIVE" HABITS
+  // ---------------------------------------------------------------------------
   useEffect(() => {
     if (!passiveLifeHabits) return;
 
@@ -719,7 +1167,7 @@ export default function OmniBotMissionControl() {
       if (facesCountRef.current === 0 && autoTrackRef.current) {
         const gentleAngles = [75, 85, 90, 96, 108, 90];
         const nextPan =
-          gentleAngles[Math.floor(Math.random() * gentleAngles.length)];
+          gentleAngles[Math.floor(Math.random() * gentleAngles.length)] ?? 90;
         updateTelemetry({ pan: nextPan }, true);
       }
 
@@ -766,138 +1214,9 @@ export default function OmniBotMissionControl() {
     []
   );
 
-  const speakWithChatterbox = useCallback(
-    async (text: string, mood: EyeMood, lang: "en" | "hi" = "en") => {
-      if (typeof window === "undefined") return;
-
-      try {
-        recognitionRef.current?.stop();
-      } catch {
-        // Ignore
-      }
-
-      if (activeAudioRef.current) {
-        activeAudioRef.current.pause();
-        activeAudioRef.current = null;
-      }
-      if ("speechSynthesis" in window) {
-        window.speechSynthesis.cancel();
-      }
-      if (speakingTimerRef.current) {
-        clearInterval(speakingTimerRef.current);
-      }
-
-      setIsSpeaking(true);
-      isSpeakingRef.current = true;
-      updateTelemetry({ mood }, true);
-
-      const resumeMicAfterSpeech = () => {
-        if (alwaysOnMicRef.current) {
-          setTimeout(() => {
-            if (!isSpeakingRef.current && !isThinkingRef.current) {
-              try {
-                recognitionRef.current?.start();
-              } catch {
-                // Ignore
-              }
-            }
-          }, 350);
-        }
-      };
-
-      try {
-        const res = await fetch(chatterboxUrl, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            text,
-            language_id: lang,
-            exaggeration: 0.55,
-            cfg_weight: 0.4,
-          }),
-        });
-
-        if (res.ok) {
-          setTtsEngineStatus(`Chatterbox (${lang.toUpperCase()})`);
-          const blob = await res.blob();
-          const audioUrl = URL.createObjectURL(blob);
-          const audio = new Audio(audioUrl);
-          activeAudioRef.current = audio;
-
-          const audioCtx = new AudioContext();
-          const source = audioCtx.createMediaElementSource(audio);
-          const analyser = audioCtx.createAnalyser();
-          analyser.fftSize = 128;
-          source.connect(analyser);
-          analyser.connect(audioCtx.destination);
-          const freqData = new Uint8Array(analyser.frequencyBinCount);
-
-          speakingTimerRef.current = setInterval(() => {
-            analyser.getByteFrequencyData(freqData);
-            let sum = 0;
-            for (let i = 0; i < 24; i++) sum += freqData[i];
-            const avg = sum / 24;
-            const mappedVu = Math.min(16, Math.max(2, Math.round(avg / 11)));
-            updateTelemetry({ volume: mappedVu }, true);
-          }, 55);
-
-          const cleanup = () => {
-            if (speakingTimerRef.current) {
-              clearInterval(speakingTimerRef.current);
-              speakingTimerRef.current = null;
-            }
-            audioCtx.close().catch(() => {});
-            URL.revokeObjectURL(audioUrl);
-            setIsSpeaking(false);
-            isSpeakingRef.current = false;
-            updateTelemetry({ volume: 0, mood: "normal" }, true);
-            resumeMicAfterSpeech();
-          };
-
-          audio.onended = cleanup;
-          audio.onerror = cleanup;
-          await audio.play();
-          return;
-        }
-      } catch {
-        setTtsEngineStatus("Browser Fallback (Start server.py)");
-      }
-
-      // Browser Fallback if local Chatterbox server isn't running
-      const cleanForBrowser = text.replace(/\[(chuckle|sigh|laugh)\]/gi, "");
-      const utterance = new SpeechSynthesisUtterance(cleanForBrowser);
-      utterance.lang = lang === "hi" ? "hi-IN" : "en-IN";
-      utterance.rate = 1.02;
-      utterance.pitch = 0.9;
-
-      let tick = 0;
-      speakingTimerRef.current = setInterval(() => {
-        tick++;
-        const wave = Math.abs(Math.sin(tick * 0.45)) * 10 + Math.random() * 5;
-        updateTelemetry(
-          { volume: Math.min(16, Math.max(3, Math.round(wave))) },
-          true
-        );
-      }, 60);
-
-      const fallbackCleanup = () => {
-        if (speakingTimerRef.current) {
-          clearInterval(speakingTimerRef.current);
-          speakingTimerRef.current = null;
-        }
-        setIsSpeaking(false);
-        isSpeakingRef.current = false;
-        updateTelemetry({ volume: 0, mood: "normal" }, true);
-        resumeMicAfterSpeech();
-      };
-
-      utterance.onend = fallbackCleanup;
-      utterance.onerror = fallbackCleanup;
-      window.speechSynthesis.speak(utterance);
-    },
-    [chatterboxUrl, updateTelemetry]
-  );
-
+  // ---------------------------------------------------------------------------
+  // 11. ASK OMNI-BOT (INCLUDES 5-CHAT MEMORY + TEAM RECOGNITION + GUEST INTRO)
+  // ---------------------------------------------------------------------------
   const triggerOmniBrain = useCallback(
     async (rawText: string, forcedIntent?: TaskIntent) => {
       const cleanPrompt = rawText.trim();
@@ -915,12 +1234,13 @@ export default function OmniBotMissionControl() {
           );
 
           if (reflex.pureCommandReply) {
+            const replyText = reflex.pureCommandReply;
             const nowTime = new Date().toLocaleTimeString();
             setChatLogs((prev) => [
               {
                 id: `bot-${Date.now()}`,
                 sender: "OMNI-BOT",
-                text: reflex.pureCommandReply!,
+                text: replyText,
                 mood: reflex.mood,
                 intent: "chat",
                 latencyMs: 5,
@@ -935,7 +1255,7 @@ export default function OmniBotMissionControl() {
               },
               ...prev,
             ]);
-            speakWithChatterbox(reflex.pureCommandReply, reflex.mood, "en");
+            speakWithChatterbox(replyText, reflex.mood, "en");
             return;
           }
         }
@@ -951,16 +1271,19 @@ export default function OmniBotMissionControl() {
       if (resolvedIntent === "guest_intro") {
         const faces = trackedFacesRef.current;
         if (faces.length >= 2) {
-          const speakerFace = faces.find((f) => f.isOperator) || faces[0];
-          const guestFace = faces.find((f) => f !== speakerFace) || faces[1];
+          const speakerFace =
+            faces.find((f) => f.matchedName !== null) ?? faces[0];
+          const guestFace = faces.find((f) => f !== speakerFace) ?? faces[1];
 
-          manualNeckHoldUntilRef.current = Date.now() + 8000;
-          updateTelemetry(
-            { pan: speakerFace.panAngle, mood: "surprised" },
-            true
-          );
-          guestTargetAngle = guestFace.panAngle;
-        } else if (faces.length === 1) {
+          if (speakerFace && guestFace) {
+            manualNeckHoldUntilRef.current = Date.now() + 8000;
+            updateTelemetry(
+              { pan: speakerFace.panAngle, mood: "surprised" },
+              true
+            );
+            guestTargetAngle = guestFace.panAngle;
+          }
+        } else if (faces.length === 1 && faces[0]) {
           const currentFacePan = faces[0].panAngle;
           guestTargetAngle = currentFacePan > 90 ? 60 : 120;
         }
@@ -972,6 +1295,17 @@ export default function OmniBotMissionControl() {
           true
         );
       }
+
+      const chronologicalHistory = [...chatLogsRef.current]
+        .filter((l) => l.id !== "init-1")
+        .slice(0, 10)
+        .reverse()
+        .map((l) => ({
+          role: (l.sender === "USER" ? "user" : "assistant") as
+            | "user"
+            | "assistant",
+          content: l.text,
+        }));
 
       const startTime = performance.now();
       if (resolvedIntent !== "autonomous_idle") {
@@ -996,7 +1330,9 @@ export default function OmniBotMissionControl() {
             imageBase64: snapshotBase64,
             intent: resolvedIntent,
             facesCount: facesCountRef.current,
-            recognizedCreatorInFrame: operatorInFrameRef.current,
+            visibleTeamMembers: visibleTeamNamesRef.current,
+            allTeamNames: teamRosterRef.current.map((m) => m.name),
+            history: chronologicalHistory,
             offlineMode,
             customApiKey,
           }),
@@ -1011,9 +1347,10 @@ export default function OmniBotMissionControl() {
         const botLang: "en" | "hi" = data.lang || "en";
 
         if (resolvedIntent === "guest_intro" && guestTargetAngle !== null) {
+          const target = guestTargetAngle;
           setTimeout(() => {
             manualNeckHoldUntilRef.current = Date.now() + 6500;
-            updateTelemetry({ pan: guestTargetAngle!, mood: "happy" }, true);
+            updateTelemetry({ pan: target, mood: "happy" }, true);
           }, 900);
         }
 
@@ -1062,6 +1399,9 @@ export default function OmniBotMissionControl() {
     return () => clearInterval(timer);
   }, [spontaneousMonologue, triggerOmniBrain]);
 
+  // ---------------------------------------------------------------------------
+  // 12. ALWAYS-ON CONTINUOUS MICROPHONE ENGINE
+  // ---------------------------------------------------------------------------
   const startAlwaysOnRecognition = useCallback(async () => {
     const SpeechRecognition =
       (window as any).SpeechRecognition ||
@@ -1214,15 +1554,18 @@ export default function OmniBotMissionControl() {
                   : "bg-rose-500 animate-pulse"
               }`}
             />
-            <div className="flex items-center gap-2.5">
+            <div className="flex flex-wrap items-center gap-2">
               <h1 className="text-lg font-extrabold tracking-wide text-white">
                 OMNI-BOT // CONTROL DECK
               </h1>
               <span className="text-[11px] font-mono font-bold px-2.5 py-0.5 rounded-md bg-sky-500/15 text-sky-300 border border-sky-500/30">
                 {wsConnected ? "ESP32:ONLINE" : "ESP32:OFFLINE"}
               </span>
+              <span className="text-[11px] font-mono font-bold px-2.5 py-0.5 rounded-md bg-emerald-500/15 text-emerald-300 border border-emerald-500/30">
+                {faceIdModelReady ? "128D-FACE-ID:READY" : "LOADING FACE-ID..."}
+              </span>
               <span className="text-[11px] font-mono font-bold px-2.5 py-0.5 rounded-md bg-purple-500/15 text-purple-300 border border-purple-500/30">
-                TTS: {ttsEngineStatus}
+                {ttsEngineStatus}
               </span>
             </div>
           </div>
@@ -1246,15 +1589,17 @@ export default function OmniBotMissionControl() {
                   : "bg-slate-800 hover:bg-slate-700 text-sky-300 border-slate-700"
               }`}
             >
-              {showDebugDrawer ? "✕ Close Config" : "🛠️ System Config & Debug"}
+              {showDebugDrawer
+                ? "✕ Close Config"
+                : "🛠️ Team Face ID & System Config"}
             </button>
           </div>
         </header>
 
-        {/* SYSTEM CONFIG & FACE ENROLLMENT DRAWER */}
+        {/* SYSTEM CONFIG & 5-MEMBER BIOMETRIC FACE ENROLLMENT DRAWER */}
         {showDebugDrawer && (
           <div className="bg-slate-900/95 border border-sky-500/40 rounded-2xl p-4 space-y-4 text-xs shadow-2xl">
-            <div className="grid grid-cols-1 md:grid-cols-5 gap-4">
+            <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
               <div>
                 <label className="text-slate-400 block mb-1 font-bold uppercase">
                   ESP32 WebSocket Target:
@@ -1277,7 +1622,7 @@ export default function OmniBotMissionControl() {
 
               <div>
                 <label className="text-purple-400 block mb-1 font-bold uppercase">
-                  Chatterbox Endpoint:
+                  Local TTS Endpoint:
                 </label>
                 <input
                   type="text"
@@ -1320,27 +1665,82 @@ export default function OmniBotMissionControl() {
                   ))}
                 </select>
               </div>
+            </div>
 
-              <div>
-                <label className="text-emerald-400 block mb-1 font-bold uppercase">
-                  Operator Face Calibration:
-                </label>
-                <div className="flex gap-1.5">
-                  <button
-                    onClick={enrollOperatorFace}
-                    className="flex-1 py-1.5 px-2 bg-emerald-500/20 hover:bg-emerald-500/30 border border-emerald-500/40 text-emerald-300 rounded-lg font-bold"
-                  >
-                    {operatorEnrolled ? "✓ Re-Scan Face" : "📸 Enroll Face"}
-                  </button>
-                  {operatorEnrolled && (
-                    <button
-                      onClick={clearOperatorEnrollment}
-                      className="py-1.5 px-2 bg-rose-500/20 border border-rose-500/40 text-rose-300 rounded-lg font-bold"
+            {/* 5-MEMBER NEURAL BIOMETRIC FACE ENROLLMENT MATRIX */}
+            <div className="pt-3 border-t border-slate-800">
+              <div className="flex items-center justify-between mb-2">
+                <span className="font-extrabold text-emerald-400 uppercase tracking-wider">
+                  👥 5-Member Team 128-D Biometric Face ID Roster (Stand in
+                  front of camera & click Enroll)
+                </span>
+                <span className="font-mono text-[11px] text-slate-400">
+                  Recognized in Frame Now:{" "}
+                  <strong className="text-emerald-300">
+                    {visibleTeamNames.length > 0
+                      ? visibleTeamNames.join(", ")
+                      : "None"}
+                  </strong>
+                </span>
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-5 gap-2.5">
+                {teamRoster.map((member, idx) => {
+                  const isEnrolled = Boolean(
+                    member.descriptor && member.descriptor.length === 128
+                  );
+                  return (
+                    <div
+                      key={member.id}
+                      className={`p-2.5 rounded-xl border ${
+                        isEnrolled
+                          ? "bg-emerald-950/25 border-emerald-500/40"
+                          : "bg-slate-950 border-slate-800"
+                      } space-y-2`}
                     >
-                      Clear
-                    </button>
-                  )}
-                </div>
+                      <div className="flex items-center justify-between text-[10px] font-mono text-slate-400">
+                        <span>SLOT #{idx + 1}</span>
+                        <span
+                          className={
+                            isEnrolled ? "text-emerald-400 font-bold" : ""
+                          }
+                        >
+                          {isEnrolled ? "● ENROLLED" : "○ EMPTY"}
+                        </span>
+                      </div>
+                      <input
+                        type="text"
+                        value={member.name}
+                        onChange={(e) =>
+                          updateTeamMemberName(idx, e.target.value)
+                        }
+                        className="w-full bg-slate-900 border border-slate-700 rounded-lg px-2 py-1 text-xs font-bold text-white"
+                        placeholder={`Teammate ${idx + 1}`}
+                      />
+                      <div className="flex gap-1">
+                        <button
+                          onClick={() => enrollTeamMemberFace(idx)}
+                          disabled={enrollingSlotIdx !== null}
+                          className="flex-1 py-1 px-2 bg-emerald-500/20 hover:bg-emerald-500/30 border border-emerald-500/40 text-emerald-300 rounded-lg font-bold text-[11px] transition"
+                        >
+                          {enrollingSlotIdx === idx
+                            ? "Scanning..."
+                            : isEnrolled
+                            ? "↻ Re-Scan"
+                            : "📸 Enroll"}
+                        </button>
+                        {isEnrolled && (
+                          <button
+                            onClick={() => clearTeamMemberSlot(idx)}
+                            className="py-1 px-2 bg-rose-500/20 border border-rose-500/40 text-rose-300 rounded-lg font-bold text-[11px]"
+                          >
+                            ✕
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })}
               </div>
             </div>
 
@@ -1351,20 +1751,17 @@ export default function OmniBotMissionControl() {
                   {lastWsPayload}
                 </code>
               </div>
-              <div className="flex flex-wrap items-center gap-4">
-                <span>
-                  OPERATOR IN FRAME:{" "}
-                  <strong
-                    className={
-                      operatorDetectedNow
-                        ? "text-emerald-400"
-                        : "text-slate-500"
-                    }
-                  >
-                    {operatorDetectedNow ? "YES" : "NO"}
-                  </strong>
-                </span>
-                <label className="flex items-center gap-1.5 cursor-pointer text-slate-300 font-sans">
+              <div className="flex flex-wrap items-center gap-4 font-sans">
+                <label className="flex items-center gap-1.5 cursor-pointer text-amber-300 font-semibold">
+                  <input
+                    type="checkbox"
+                    checked={crowdControlEnabled}
+                    onChange={(e) => setCrowdControlEnabled(e.target.checked)}
+                    className="accent-amber-400"
+                  />
+                  Auto Crowd Alert (&gt;4 People)
+                </label>
+                <label className="flex items-center gap-1.5 cursor-pointer text-slate-300">
                   <input
                     type="checkbox"
                     checked={spontaneousMonologue}
@@ -1373,15 +1770,12 @@ export default function OmniBotMissionControl() {
                   />
                   Live Camera Idle Comments (30s)
                 </label>
-                <label className="flex items-center gap-1.5 cursor-pointer text-slate-300 font-sans">
-                  <input
-                    type="checkbox"
-                    checked={offlineMode}
-                    onChange={(e) => setOfflineMode(e.target.checked)}
-                    className="accent-amber-400"
-                  />
-                  Offline Mode
-                </label>
+                <button
+                  onClick={executeCrowdControlAlert}
+                  className="px-2.5 py-1 rounded-lg bg-rose-500/20 border border-rose-500/40 text-rose-300 font-bold text-[11px]"
+                >
+                  😡 Test Crowd Warning Now
+                </button>
               </div>
             </div>
           </div>
@@ -1393,10 +1787,17 @@ export default function OmniBotMissionControl() {
           <div className="lg:col-span-6 flex flex-col gap-4">
             <div className="bg-slate-900/90 border border-slate-800 rounded-2xl p-4 shadow-xl">
               <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
-                <span className="text-xs font-extrabold uppercase tracking-wider text-slate-300">
-                  OPTICAL SENSOR FEED ({facesDetected} FACE
-                  {facesDetected === 1 ? "" : "S"} DETECTED)
-                </span>
+                <div className="flex items-center gap-2">
+                  <span className="text-xs font-extrabold uppercase tracking-wider text-slate-300">
+                    OPTICAL FEED ({facesDetected} FACE
+                    {facesDetected === 1 ? "" : "S"})
+                  </span>
+                  {facesDetected >= 5 && (
+                    <span className="text-[10px] font-mono font-bold px-2 py-0.5 rounded bg-rose-500/20 text-rose-300 border border-rose-500/40 animate-pulse">
+                      ⚠️ CROWD OVERLOAD (&gt;4)
+                    </span>
+                  )}
+                </div>
                 <div className="flex items-center gap-3 text-xs font-medium text-slate-300">
                   <label className="flex items-center gap-1.5 cursor-pointer">
                     <input
@@ -1589,7 +1990,7 @@ export default function OmniBotMissionControl() {
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <div className="flex items-center gap-2">
                   <span className="text-xs font-extrabold uppercase tracking-wider text-slate-300">
-                    VOICE & CHAT STREAM
+                    VOICE & 5-CHAT MEMORY STREAM
                   </span>
                   <span className="text-[11px] font-mono px-2 py-0.5 rounded bg-slate-950 border border-slate-800 text-sky-300">
                     {activeIntentBadge === "guest_intro"
@@ -1598,7 +1999,7 @@ export default function OmniBotMissionControl() {
                       ? "📐 MATH OCR"
                       : activeIntentBadge === "object_inspect"
                       ? "✋ OBJECT ID"
-                      : "💬 CHATTERBOX MULTILINGUAL"}
+                      : "🧠 5-TURN MEMORY"}
                   </span>
                 </div>
 
@@ -1643,7 +2044,7 @@ export default function OmniBotMissionControl() {
                     : isThinking
                     ? "⚡ PROCESSING..."
                     : isSpeaking
-                    ? "🔊 SPEAKING VIA CHATTERBOX..."
+                    ? "🔊 OMNI-BOT SPEAKING..."
                     : "🎙️ START ALWAYS-ON COLLAR MIC"}
                 </button>
 
@@ -1663,6 +2064,14 @@ export default function OmniBotMissionControl() {
               <div className="flex flex-wrap gap-1.5 pt-1">
                 {[
                   {
+                    label: "🚐 Maruti Omni Van Tease",
+                    text: "Oye Omni, tera naam Maruti Omni van pe rakha hai kya?",
+                  },
+                  {
+                    label: "😡 Crowd Warning (>4)",
+                    text: "__CROWD_ALERT__",
+                  },
+                  {
                     label: "🤝 Introduce Teacher",
                     text: "Hey Omni, meet my class 10 teacher standing here with me!",
                   },
@@ -1670,18 +2079,14 @@ export default function OmniBotMissionControl() {
                     label: "🇮🇳 Hindi Chat Test",
                     text: "ओमनी भाई, आज एग्जीबिशन में कैसा लग रहा है?",
                   },
-                  {
-                    label: "✋ Inspect Object",
-                    text: "Can you see and tell me what I am holding in my hand?",
-                  },
-                  {
-                    label: "👀 Look Right",
-                    text: "Omni, look to your right!",
-                  },
                 ].map((item) => (
                   <button
                     key={item.label}
-                    onClick={() => triggerOmniBrain(item.text)}
+                    onClick={() =>
+                      item.text === "__CROWD_ALERT__"
+                        ? executeCrowdControlAlert()
+                        : triggerOmniBrain(item.text)
+                    }
                     className="text-xs bg-slate-950 hover:bg-slate-800 border border-slate-800 text-slate-300 px-2.5 py-1.5 rounded-lg font-medium transition"
                   >
                     {item.label}
@@ -1729,7 +2134,7 @@ export default function OmniBotMissionControl() {
                 type="text"
                 value={promptInput}
                 onChange={(e) => setPromptInput(e.target.value)}
-                placeholder="Say 'Hey Omni, meet my class 10 teacher', or ask in English/Hindi..."
+                placeholder="Ask a follow-up question, tease about Maruti Omni, or chat in Hindi/English..."
                 className="flex-1 bg-slate-950 border border-slate-800 rounded-xl px-3.5 py-2.5 text-xs text-white focus:outline-none focus:border-sky-400"
               />
               <button
