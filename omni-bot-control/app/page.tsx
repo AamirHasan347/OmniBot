@@ -24,6 +24,7 @@ interface ChatLog {
   id: string;
   sender: "USER" | "OMNI-BOT";
   text: string;
+  mathSteps?: string[];
   mood?: EyeMood;
   intent?: TaskIntent;
   latencyMs?: number;
@@ -53,7 +54,6 @@ const DEFAULT_TEAM_ROSTER: TeamMemberProfile[] = [
   { id: "member-5", name: "Teammate 5", role: "Team Member", descriptor: null },
 ];
 
-// Euclidean distance between two 128-D face-api descriptors (< 0.52 is a strong biometric match)
 function euclideanDistance128(
   descA: number[],
   descB: Float32Array | number[]
@@ -181,6 +181,10 @@ function detectUserIntent(text: string): TaskIntent {
     "algebra",
     "hisab",
     "sawal",
+    "plus",
+    "minus",
+    "multiply",
+    "divide",
   ];
   if (mathKeywords.some((k) => lower.includes(k))) {
     return "math_solve";
@@ -237,20 +241,17 @@ export default function OmniBotMissionControl() {
   );
   const [lastAiLatency, setLastAiLatency] = useState<number>(0);
 
-  // 5-Member Biometric Face ID Roster
   const [teamRoster, setTeamRoster] =
     useState<TeamMemberProfile[]>(DEFAULT_TEAM_ROSTER);
   const [faceIdModelReady, setFaceIdModelReady] = useState<boolean>(false);
   const [visibleTeamNames, setVisibleTeamNames] = useState<string[]>([]);
   const [enrollingSlotIdx, setEnrollingSlotIdx] = useState<number | null>(null);
 
-  // Behavior Toggles
   const [autoTrackFace, setAutoTrackFace] = useState<boolean>(true);
   const [passiveLifeHabits, setPassiveLifeHabits] = useState<boolean>(true);
   const [crowdControlEnabled, setCrowdControlEnabled] = useState<boolean>(true);
   const [spontaneousMonologue, setSpontaneousMonologue] =
     useState<boolean>(false);
-  const [alwaysOnMic, setAlwaysOnMic] = useState<boolean>(true);
   const [invertPanDirection, setInvertPanDirection] = useState<boolean>(false);
   const [offlineMode, setOfflineMode] = useState<boolean>(false);
 
@@ -270,10 +271,10 @@ export default function OmniBotMissionControl() {
   const [fps, setFps] = useState<number>(0);
   const [facesDetected, setFacesDetected] = useState<number>(0);
 
-  const [isListening, setIsListening] = useState<boolean>(false);
-  const [micLevel, setMicLevel] = useState<number>(0);
+  const [micActive, setMicActive] = useState<boolean>(false);
+  const [liveHeardWords, setLiveHeardWords] = useState<string>("");
   const [micStatusHint, setMicStatusHint] = useState<string>(
-    "Click 'Start Always-On Mic' to begin"
+    "Click 'Activate Continuous Mic' once to start talking"
   );
   const [isThinking, setIsThinking] = useState<boolean>(false);
   const [isSpeaking, setIsSpeaking] = useState<boolean>(false);
@@ -285,7 +286,7 @@ export default function OmniBotMissionControl() {
     {
       id: "init-1",
       sender: "OMNI-BOT",
-      text: "Systems online! 5-Turn Contextual Memory, 5-Member Neural Face ID, and >4 Person Crowd Control are active.",
+      text: "Systems online! Mathematical equation rendering, continuous voice recognition, and crimson red angry mode are ready.",
       mood: "normal",
       intent: "chat",
       timestamp: "READY",
@@ -323,7 +324,7 @@ export default function OmniBotMissionControl() {
 
   const autoTrackRef = useRef<boolean>(true);
   const invertPanRef = useRef<boolean>(false);
-  const alwaysOnMicRef = useRef<boolean>(true);
+  const micWantedRef = useRef<boolean>(false);
   const crowdControlEnabledRef = useRef<boolean>(true);
   const isSpeakingRef = useRef<boolean>(false);
   const isThinkingRef = useRef<boolean>(false);
@@ -335,8 +336,8 @@ export default function OmniBotMissionControl() {
   const lastInteractionMsRef = useRef<number>(0);
   const speakingTimerRef = useRef<NodeJS.Timeout | null>(null);
   const recognitionRef = useRef<any>(null);
-  const micAudioCtxRef = useRef<AudioContext | null>(null);
-  const micStreamRef = useRef<MediaStream | null>(null);
+  const silenceTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const accumulatedTranscriptRef = useRef<string>("");
 
   useEffect(() => {
     chatLogsRef.current = chatLogs;
@@ -371,10 +372,6 @@ export default function OmniBotMissionControl() {
   }, [invertPanDirection]);
 
   useEffect(() => {
-    alwaysOnMicRef.current = alwaysOnMic;
-  }, [alwaysOnMic]);
-
-  useEffect(() => {
     crowdControlEnabledRef.current = crowdControlEnabled;
   }, [crowdControlEnabled]);
 
@@ -407,7 +404,6 @@ export default function OmniBotMissionControl() {
     };
   }, []);
 
-  // Background 128-D Biometric Face Matcher Loop (Every 650ms)
   useEffect(() => {
     const interval = setInterval(async () => {
       const faceapi = faceApiRef.current;
@@ -477,7 +473,6 @@ export default function OmniBotMissionControl() {
     return () => clearInterval(interval);
   }, []);
 
-  // Strictly typed .map() state updates so TypeScript never shows red underlines
   const enrollTeamMemberFace = useCallback(async (slotIndex: number) => {
     const faceapi = faceApiRef.current;
     const video = videoRef.current;
@@ -694,7 +689,7 @@ export default function OmniBotMissionControl() {
     try {
       const tempStream = await navigator.mediaDevices.getUserMedia({
         video: true,
-        audio: true,
+        audio: false,
       });
       tempStream.getTracks().forEach((t) => t.stop());
 
@@ -864,12 +859,6 @@ export default function OmniBotMissionControl() {
 
   const speakWithChatterbox = useCallback(
     async (text: string, mood: EyeMood, lang: "en" | "hi" = "en") => {
-      try {
-        recognitionRef.current?.stop();
-      } catch {
-        // Ignore
-      }
-
       if (activeAudioRef.current) {
         activeAudioRef.current.pause();
         activeAudioRef.current = null;
@@ -886,33 +875,15 @@ export default function OmniBotMissionControl() {
       setIsSpeaking(false);
       isSpeakingRef.current = false;
       updateTelemetry({ volume: 0, mood: "normal" }, true);
-
-      if (alwaysOnMicRef.current) {
-        setTimeout(() => {
-          if (!isSpeakingRef.current && !isThinkingRef.current) {
-            try {
-              recognitionRef.current?.start();
-            } catch {
-              // Ignore
-            }
-          }
-        }, 350);
-      }
     },
     [playSingleTtsSegment, updateTelemetry]
   );
 
-  // SPECIAL EVENT: >4 People Crowd Control Choreography
+  // SPECIAL EVENT: >4 People Crowd Control Choreography (Turns Ring & Eyes Red!)
   const executeCrowdControlAlert = useCallback(async () => {
     if (isSpeakingRef.current || isThinkingRef.current) return;
     lastCrowdAlertMsRef.current = Date.now();
     lastInteractionMsRef.current = Date.now();
-
-    try {
-      recognitionRef.current?.stop();
-    } catch {
-      // Ignore
-    }
 
     setIsSpeaking(true);
     isSpeakingRef.current = true;
@@ -932,7 +903,7 @@ export default function OmniBotMissionControl() {
       {
         id: `crowd-${Date.now()}`,
         sender: "OMNI-BOT",
-        text: "हाँ आओ ना, घुस जाओ मेरे अंदर! ... [2s Glare] ... हटो सब सामने से!!!",
+        text: "हाँ आओ ना, घुस जाओ मेरे अंदर! ... [2s Red Glare] ... हटो सब सामने से!!!",
         mood: "angry",
         intent: "chat",
         latencyMs: 0,
@@ -941,13 +912,14 @@ export default function OmniBotMissionControl() {
       ...prev,
     ]);
 
-    updateTelemetry({ pan: crowdAngle, mood: "suspicious" }, true);
+    updateTelemetry({ pan: crowdAngle, mood: "angry" }, true);
     await playSingleTtsSegment(
       "हाँ आओ ना, घुस जाओ मेरे अंदर!",
-      "suspicious",
+      "angry",
       "hi"
     );
 
+    // 2-Second Dramatic Silence with Crimson Red Ring & Angry Eyes!
     updateTelemetry({ mood: "angry", volume: 0 }, true);
     await new Promise((r) => setTimeout(r, 2000));
 
@@ -959,16 +931,6 @@ export default function OmniBotMissionControl() {
     );
     setIsSpeaking(false);
     isSpeakingRef.current = false;
-
-    if (alwaysOnMicRef.current) {
-      setTimeout(() => {
-        try {
-          recognitionRef.current?.start();
-        } catch {
-          // Ignore
-        }
-      }, 350);
-    }
   }, [playSingleTtsSegment, updateTelemetry]);
 
   // ---------------------------------------------------------------------------
@@ -1215,7 +1177,7 @@ export default function OmniBotMissionControl() {
   );
 
   // ---------------------------------------------------------------------------
-  // 11. ASK OMNI-BOT (INCLUDES 5-CHAT MEMORY + TEAM RECOGNITION + GUEST INTRO)
+  // 11. ASK OMNI-BOT (INCLUDES MATH EQUATIONS + 5-CHAT MEMORY + GUEST INTRO)
   // ---------------------------------------------------------------------------
   const triggerOmniBrain = useCallback(
     async (rawText: string, forcedIntent?: TaskIntent) => {
@@ -1345,6 +1307,9 @@ export default function OmniBotMissionControl() {
         const botReply: string = data.reply || "Hello!";
         const botMood: EyeMood = data.mood || "happy";
         const botLang: "en" | "hi" = data.lang || "en";
+        const botMathSteps: string[] = Array.isArray(data.mathSteps)
+          ? data.mathSteps
+          : [];
 
         if (resolvedIntent === "guest_intro" && guestTargetAngle !== null) {
           const target = guestTargetAngle;
@@ -1358,6 +1323,7 @@ export default function OmniBotMissionControl() {
           id: `bot-${Date.now()}`,
           sender: "OMNI-BOT",
           text: botReply,
+          mathSteps: botMathSteps,
           mood: botMood,
           intent: resolvedIntent,
           latencyMs: elapsed,
@@ -1400,48 +1366,24 @@ export default function OmniBotMissionControl() {
   }, [spontaneousMonologue, triggerOmniBrain]);
 
   // ---------------------------------------------------------------------------
-  // 12. ALWAYS-ON CONTINUOUS MICROPHONE ENGINE
+  // 12. ROCK-SOLID CONTINUOUS MICROPHONE ENGINE (ZERO BLINKING + SILENCE COMMIT)
   // ---------------------------------------------------------------------------
-  const startAlwaysOnRecognition = useCallback(async () => {
+  const initContinuousMic = useCallback(() => {
+    if (typeof window === "undefined") return;
     const SpeechRecognition =
       (window as any).SpeechRecognition ||
       (window as any).webkitSpeechRecognition;
 
     if (!SpeechRecognition) {
-      setMicStatusHint("Use Google Chrome for Always-On Voice!");
+      setMicStatusHint(
+        "Browser does not support Web Speech API — Please open in Google Chrome!"
+      );
       return;
-    }
-
-    if (!micAudioCtxRef.current) {
-      try {
-        const stream = await navigator.mediaDevices.getUserMedia({
-          audio: selectedMicId ? { deviceId: { exact: selectedMicId } } : true,
-        });
-        micStreamRef.current = stream;
-        const audioCtx = new AudioContext();
-        micAudioCtxRef.current = audioCtx;
-        const source = audioCtx.createMediaStreamSource(stream);
-        const analyser = audioCtx.createAnalyser();
-        analyser.fftSize = 256;
-        source.connect(analyser);
-        const dataArray = new Uint8Array(analyser.frequencyBinCount);
-
-        const checkMicVolume = () => {
-          if (!micAudioCtxRef.current) return;
-          analyser.getByteFrequencyData(dataArray);
-          const avg =
-            dataArray.reduce((sum, val) => sum + val, 0) / dataArray.length;
-          setMicLevel(Math.min(100, Math.round(avg * 2.2)));
-          requestAnimationFrame(checkMicVolume);
-        };
-        requestAnimationFrame(checkMicVolume);
-      } catch {
-        // Ignore
-      }
     }
 
     if (recognitionRef.current) {
       try {
+        recognitionRef.current.onend = null;
         recognitionRef.current.stop();
       } catch {
         // Ignore
@@ -1450,62 +1392,107 @@ export default function OmniBotMissionControl() {
 
     const recognition = new SpeechRecognition();
     recognition.lang = micLang;
-    recognition.continuous = false;
+    // CRITICAL FIX: continuous=true prevents the mic from shutting off and blinking every 2 seconds!
+    recognition.continuous = true;
     recognition.interimResults = true;
     recognition.maxAlternatives = 1;
 
-    let finalTranscript = "";
-
     recognition.onstart = () => {
-      setIsListening(true);
-      setMicStatusHint("Always-On Mic Active — Listening");
+      setMicActive(true);
+      setMicStatusHint(
+        `Continuous Mic Locked (${micLang}) — Speak naturally anytime!`
+      );
     };
 
     recognition.onresult = (event: any) => {
-      if (isSpeakingRef.current) return;
-      let interim = "";
+      // Ignore audio while Omni-Bot is speaking out loud
+      if (isSpeakingRef.current || isThinkingRef.current) {
+        accumulatedTranscriptRef.current = "";
+        return;
+      }
+
+      let interimTranscript = "";
+      let latestFinal = "";
+
       for (let i = event.resultIndex; i < event.results.length; ++i) {
-        const chunk = event.results[i][0].transcript;
-        if (event.results[i].isFinal) {
-          finalTranscript += chunk;
+        const res = event.results[i];
+        const chunk = res?.[0]?.transcript || "";
+        if (res?.isFinal) {
+          latestFinal += chunk + " ";
         } else {
-          interim += chunk;
+          interimTranscript += chunk;
         }
       }
-      setPromptInput(finalTranscript || interim);
-    };
 
-    recognition.onerror = () => {
-      setIsListening(false);
-    };
+      if (latestFinal) {
+        accumulatedTranscriptRef.current = (
+          accumulatedTranscriptRef.current +
+          " " +
+          latestFinal
+        ).trim();
+      }
 
-    recognition.onend = () => {
-      setIsListening(false);
-      const spoken = finalTranscript.trim();
-      finalTranscript = "";
+      const combinedText = (
+        accumulatedTranscriptRef.current +
+        " " +
+        interimTranscript
+      ).trim();
 
-      if (spoken && !isSpeakingRef.current) {
-        setMicStatusHint(`Heard: "${spoken}"`);
-        setPromptInput("");
-        triggerOmniBrain(spoken);
-      } else if (
-        alwaysOnMicRef.current &&
-        !isSpeakingRef.current &&
-        !isThinkingRef.current
-      ) {
-        setTimeout(() => {
+      setLiveHeardWords(combinedText);
+      setPromptInput(combinedText);
+
+      // Debounce Silence Timer: The moment you pause speaking for 1.1 seconds, fire to Omni-Bot!
+      if (silenceTimerRef.current) {
+        clearTimeout(silenceTimerRef.current);
+      }
+
+      if (combinedText.length > 1) {
+        silenceTimerRef.current = setTimeout(() => {
+          const finalToSend = (
+            accumulatedTranscriptRef.current || combinedText
+          ).trim();
+          accumulatedTranscriptRef.current = "";
+          setLiveHeardWords("");
+          setPromptInput("");
           if (
-            alwaysOnMicRef.current &&
+            finalToSend &&
             !isSpeakingRef.current &&
             !isThinkingRef.current
           ) {
+            setMicStatusHint(`Sent: "${finalToSend}"`);
+            triggerOmniBrain(finalToSend);
+          }
+        }, 1100);
+      }
+    };
+
+    recognition.onerror = (event: any) => {
+      if (event.error === "not-allowed" || event.error === "service-not-allowed") {
+        micWantedRef.current = false;
+        setMicActive(false);
+        setMicStatusHint(
+          "Mic Permission Blocked! Allow Microphone in Chrome URL bar."
+        );
+      } else if (event.error !== "no-speech" && event.error !== "aborted") {
+        setMicStatusHint(`Mic note: ${event.error} (Auto-recovering...)`);
+      }
+    };
+
+    recognition.onend = () => {
+      // Only auto-restart after a calm 600ms delay if continuous mode is still wanted
+      if (micWantedRef.current) {
+        setTimeout(() => {
+          if (micWantedRef.current) {
             try {
               recognition.start();
             } catch {
-              // Ignore
+              // Ignore if already started
             }
           }
-        }, 300);
+        }, 600);
+      } else {
+        setMicActive(false);
+        setMicStatusHint("Mic Paused");
       }
     };
 
@@ -1515,21 +1502,31 @@ export default function OmniBotMissionControl() {
     } catch {
       // Ignore
     }
-  }, [micLang, selectedMicId, triggerOmniBrain]);
+  }, [micLang, triggerOmniBrain]);
 
   const toggleMicButton = useCallback(() => {
-    if (isListening) {
-      setAlwaysOnMic(false);
-      alwaysOnMicRef.current = false;
-      recognitionRef.current?.stop();
-      setIsListening(false);
+    if (micActive) {
+      micWantedRef.current = false;
+      setMicActive(false);
+      if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
+      try {
+        recognitionRef.current?.stop();
+      } catch {
+        // Ignore
+      }
       setMicStatusHint("Mic Paused");
     } else {
-      setAlwaysOnMic(true);
-      alwaysOnMicRef.current = true;
-      startAlwaysOnRecognition();
+      micWantedRef.current = true;
+      initContinuousMic();
     }
-  }, [isListening, startAlwaysOnRecognition]);
+  }, [micActive, initContinuousMic]);
+
+  // Restart continuous recognition cleanly if user switches language pill (EN-IN <-> HI-IN)
+  useEffect(() => {
+    if (micWantedRef.current) {
+      initContinuousMic();
+    }
+  }, [micLang, initContinuousMic]);
 
   const moods: EyeMood[] = [
     "normal",
@@ -1541,15 +1538,23 @@ export default function OmniBotMissionControl() {
     "angry",
   ];
 
+  const isAngryMode = currentMood === "angry";
+
   return (
     <div className="min-h-screen bg-[#050811] text-slate-100 font-sans p-4 md:p-6">
       <div className="max-w-7xl mx-auto space-y-4">
         {/* HEADER */}
-        <header className="bg-slate-900/95 border border-slate-800 rounded-2xl px-5 py-3.5 flex flex-wrap items-center justify-between gap-4 shadow-xl">
+        <header
+          className={`bg-slate-900/95 border rounded-2xl px-5 py-3.5 flex flex-wrap items-center justify-between gap-4 shadow-xl transition-colors ${
+            isAngryMode ? "border-rose-500/70 shadow-rose-950/40" : "border-slate-800"
+          }`}
+        >
           <div className="flex items-center gap-3.5">
             <div
               className={`h-3.5 w-3.5 rounded-full ${
-                wsConnected
+                isAngryMode
+                  ? "bg-rose-500 shadow-[0_0_14px_#f43f5e] animate-ping"
+                  : wsConnected
                   ? "bg-emerald-400 shadow-[0_0_12px_#34d399]"
                   : "bg-rose-500 animate-pulse"
               }`}
@@ -1561,12 +1566,11 @@ export default function OmniBotMissionControl() {
               <span className="text-[11px] font-mono font-bold px-2.5 py-0.5 rounded-md bg-sky-500/15 text-sky-300 border border-sky-500/30">
                 {wsConnected ? "ESP32:ONLINE" : "ESP32:OFFLINE"}
               </span>
-              <span className="text-[11px] font-mono font-bold px-2.5 py-0.5 rounded-md bg-emerald-500/15 text-emerald-300 border border-emerald-500/30">
-                {faceIdModelReady ? "128D-FACE-ID:READY" : "LOADING FACE-ID..."}
-              </span>
-              <span className="text-[11px] font-mono font-bold px-2.5 py-0.5 rounded-md bg-purple-500/15 text-purple-300 border border-purple-500/30">
-                {ttsEngineStatus}
-              </span>
+              {isAngryMode && (
+                <span className="text-[11px] font-mono font-extrabold px-2.5 py-0.5 rounded-md bg-rose-500 text-white shadow-[0_0_12px_#f43f5e]">
+                  🔴 ANGRY OVERDRIVE: RED RING & EYES
+                </span>
+              )}
             </div>
           </div>
 
@@ -1671,11 +1675,10 @@ export default function OmniBotMissionControl() {
             <div className="pt-3 border-t border-slate-800">
               <div className="flex items-center justify-between mb-2">
                 <span className="font-extrabold text-emerald-400 uppercase tracking-wider">
-                  👥 5-Member Team 128-D Biometric Face ID Roster (Stand in
-                  front of camera & click Enroll)
+                  👥 5-Member Team 128-D Biometric Face ID Roster
                 </span>
                 <span className="font-mono text-[11px] text-slate-400">
-                  Recognized in Frame Now:{" "}
+                  Recognized in Frame:{" "}
                   <strong className="text-emerald-300">
                     {visibleTeamNames.length > 0
                       ? visibleTeamNames.join(", ")
@@ -1715,13 +1718,12 @@ export default function OmniBotMissionControl() {
                           updateTeamMemberName(idx, e.target.value)
                         }
                         className="w-full bg-slate-900 border border-slate-700 rounded-lg px-2 py-1 text-xs font-bold text-white"
-                        placeholder={`Teammate ${idx + 1}`}
                       />
                       <div className="flex gap-1">
                         <button
                           onClick={() => enrollTeamMemberFace(idx)}
                           disabled={enrollingSlotIdx !== null}
-                          className="flex-1 py-1 px-2 bg-emerald-500/20 hover:bg-emerald-500/30 border border-emerald-500/40 text-emerald-300 rounded-lg font-bold text-[11px] transition"
+                          className="flex-1 py-1 px-2 bg-emerald-500/20 hover:bg-emerald-500/30 border border-emerald-500/40 text-emerald-300 rounded-lg font-bold text-[11px]"
                         >
                           {enrollingSlotIdx === idx
                             ? "Scanning..."
@@ -1741,41 +1743,6 @@ export default function OmniBotMissionControl() {
                     </div>
                   );
                 })}
-              </div>
-            </div>
-
-            <div className="pt-2 border-t border-slate-800 flex flex-wrap items-center justify-between gap-3 font-mono text-[11px] text-slate-400">
-              <div>
-                LAST WS PACKET:{" "}
-                <code className="text-sky-300 bg-slate-950 px-2 py-0.5 rounded border border-slate-800">
-                  {lastWsPayload}
-                </code>
-              </div>
-              <div className="flex flex-wrap items-center gap-4 font-sans">
-                <label className="flex items-center gap-1.5 cursor-pointer text-amber-300 font-semibold">
-                  <input
-                    type="checkbox"
-                    checked={crowdControlEnabled}
-                    onChange={(e) => setCrowdControlEnabled(e.target.checked)}
-                    className="accent-amber-400"
-                  />
-                  Auto Crowd Alert (&gt;4 People)
-                </label>
-                <label className="flex items-center gap-1.5 cursor-pointer text-slate-300">
-                  <input
-                    type="checkbox"
-                    checked={spontaneousMonologue}
-                    onChange={(e) => setSpontaneousMonologue(e.target.checked)}
-                    className="accent-sky-400"
-                  />
-                  Live Camera Idle Comments (30s)
-                </label>
-                <button
-                  onClick={executeCrowdControlAlert}
-                  className="px-2.5 py-1 rounded-lg bg-rose-500/20 border border-rose-500/40 text-rose-300 font-bold text-[11px]"
-                >
-                  😡 Test Crowd Warning Now
-                </button>
               </div>
             </div>
           </div>
@@ -1863,7 +1830,7 @@ export default function OmniBotMissionControl() {
                 <button
                   onClick={() =>
                     triggerOmniBrain(
-                      "Read the math equation or question written on this paper/board and solve it!",
+                      "Read the math equation or question written on this paper/board and solve it step by step!",
                       "math_solve"
                     )
                   }
@@ -1887,8 +1854,12 @@ export default function OmniBotMissionControl() {
               </div>
             </div>
 
-            {/* SERVO OVERRIDE & VU */}
-            <div className="bg-slate-900/90 border border-slate-800 rounded-2xl p-4 space-y-4 shadow-xl">
+            {/* SERVO OVERRIDE, RED/CYAN RING VU & DIGITAL EYE SIMULATOR */}
+            <div
+              className={`bg-slate-900/90 border rounded-2xl p-4 space-y-4 shadow-xl transition-colors ${
+                isAngryMode ? "border-rose-500/60" : "border-slate-800"
+              }`}
+            >
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                 <div>
                   <div className="flex justify-between text-xs font-bold text-slate-300 mb-1">
@@ -1939,9 +1910,17 @@ export default function OmniBotMissionControl() {
 
                 <div>
                   <div className="flex justify-between text-xs font-bold text-slate-300 mb-1">
-                    <span>ARC REACTOR FFT VU</span>
-                    <span className="font-mono text-sky-400">
-                      {vuVolume}/16 LEDs
+                    <span>
+                      {isAngryMode
+                        ? "🔴 CRIMSON RED RING LIGHT"
+                        : "ARC REACTOR RING LIGHT"}
+                    </span>
+                    <span
+                      className={`font-mono ${
+                        isAngryMode ? "text-rose-400 font-bold" : "text-sky-400"
+                      }`}
+                    >
+                      {isAngryMode ? "RED OVERDRIVE" : `${vuVolume}/16 LEDs`}
                     </span>
                   </div>
                   <div className="grid grid-cols-16 gap-1 h-5 bg-slate-950 p-1 rounded-lg border border-slate-800">
@@ -1949,7 +1928,9 @@ export default function OmniBotMissionControl() {
                       <div
                         key={idx}
                         className={`rounded-xs transition-all ${
-                          idx < vuVolume
+                          isAngryMode
+                            ? "bg-rose-500 shadow-[0_0_8px_#f43f5e]"
+                            : idx < vuVolume
                             ? idx >= 12
                               ? "bg-fuchsia-400"
                               : "bg-sky-400"
@@ -1961,10 +1942,29 @@ export default function OmniBotMissionControl() {
                 </div>
               </div>
 
+              {/* Dual Eye Expression Pills + Live Red Angry Eye Indicator */}
               <div>
-                <span className="text-xs font-bold text-slate-300 block mb-2">
-                  DUAL OLED EYE EXPRESSIONS:
-                </span>
+                <div className="flex items-center justify-between mb-2">
+                  <span className="text-xs font-bold text-slate-300">
+                    DUAL EYE EXPRESSIONS:
+                  </span>
+                  <div className="flex items-center gap-2">
+                    <span
+                      className={`inline-block w-3 h-2 rounded-xs ${
+                        isAngryMode
+                          ? "bg-rose-500 shadow-[0_0_10px_#f43f5e] -rotate-12"
+                          : "bg-sky-400"
+                      }`}
+                    />
+                    <span
+                      className={`inline-block w-3 h-2 rounded-xs ${
+                        isAngryMode
+                          ? "bg-rose-500 shadow-[0_0_10px_#f43f5e] rotate-12"
+                          : "bg-sky-400"
+                      }`}
+                    />
+                  </div>
+                </div>
                 <div className="flex flex-wrap gap-1.5">
                   {moods.map((m) => (
                     <button
@@ -1972,7 +1972,9 @@ export default function OmniBotMissionControl() {
                       onClick={() => updateTelemetry({ mood: m }, true)}
                       className={`px-3 py-1.5 rounded-lg text-xs font-bold uppercase border transition ${
                         currentMood === m
-                          ? "bg-sky-500 text-slate-950 border-sky-400"
+                          ? m === "angry"
+                            ? "bg-rose-600 text-white border-rose-400 shadow-[0_0_12px_#f43f5e]"
+                            : "bg-sky-500 text-slate-950 border-sky-400"
                           : "bg-slate-950 border-slate-800 text-slate-400 hover:text-slate-200"
                       }`}
                     >
@@ -1984,19 +1986,19 @@ export default function OmniBotMissionControl() {
             </div>
           </div>
 
-          {/* RIGHT COLUMN: VOICE + CHAT STREAM */}
+          {/* RIGHT COLUMN: VOICE + CHAT & MATH EQUATION STREAM */}
           <div className="lg:col-span-6 flex flex-col bg-slate-900/90 border border-slate-800 rounded-2xl p-4 shadow-xl justify-between gap-4">
             <div className="space-y-3">
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <div className="flex items-center gap-2">
                   <span className="text-xs font-extrabold uppercase tracking-wider text-slate-300">
-                    VOICE & 5-CHAT MEMORY STREAM
+                    VOICE & EQUATION STREAM
                   </span>
                   <span className="text-[11px] font-mono px-2 py-0.5 rounded bg-slate-950 border border-slate-800 text-sky-300">
                     {activeIntentBadge === "guest_intro"
                       ? "🤝 GUEST INTRO PIVOT"
                       : activeIntentBadge === "math_solve"
-                      ? "📐 MATH OCR"
+                      ? "📐 STEP-BY-STEP MATH"
                       : activeIntentBadge === "object_inspect"
                       ? "✋ OBJECT ID"
                       : "🧠 5-TURN MEMORY"}
@@ -2032,52 +2034,47 @@ export default function OmniBotMissionControl() {
                   onClick={toggleMicButton}
                   disabled={isThinking}
                   className={`w-full py-3.5 px-4 rounded-xl font-extrabold text-sm border transition flex items-center justify-center gap-2.5 shadow-lg ${
-                    isListening
-                      ? "bg-emerald-500/25 border-emerald-400 text-emerald-200 animate-pulse"
+                    micActive
+                      ? "bg-emerald-500/20 border-emerald-400 text-emerald-200"
                       : isSpeaking
                       ? "bg-sky-500/20 border-sky-400 text-sky-200"
                       : "bg-sky-400 hover:bg-sky-300 text-slate-950 border-transparent"
                   }`}
                 >
-                  {isListening
-                    ? "🎙️ ALWAYS-ON MIC ACTIVE (SPEAK ANYTIME)"
-                    : isThinking
-                    ? "⚡ PROCESSING..."
-                    : isSpeaking
-                    ? "🔊 OMNI-BOT SPEAKING..."
-                    : "🎙️ START ALWAYS-ON COLLAR MIC"}
+                  {micActive
+                    ? "🎙️ CONTINUOUS MIC LOCKED ON (SPEAK ANYTIME — CLICK TO PAUSE)"
+                    : "🎙️ ACTIVATE CONTINUOUS COLLAR MIC"}
                 </button>
 
-                <div className="flex items-center gap-2 px-1">
-                  <div className="w-28 h-1.5 bg-slate-950 rounded-full overflow-hidden border border-slate-800">
-                    <div
-                      className="h-full bg-emerald-400 transition-all duration-75"
-                      style={{ width: `${micLevel}%` }}
-                    />
-                  </div>
-                  <span className="text-[11px] text-slate-400 truncate font-mono">
-                    {micStatusHint}
+                <div className="flex items-center justify-between px-1 text-[11px] font-mono">
+                  <span className="text-slate-400 truncate">
+                    {liveHeardWords
+                      ? `Hearing: "${liveHeardWords}"`
+                      : micStatusHint}
                   </span>
+                  {micActive && (
+                    <span className="text-emerald-400 font-bold">● LIVE</span>
+                  )}
                 </div>
               </div>
 
               <div className="flex flex-wrap gap-1.5 pt-1">
                 {[
                   {
+                    label: "📐 Demo Math Equation",
+                    text: "Solve this quadratic equation step by step: x squared minus 5x plus 6 equals 0",
+                  },
+                  {
                     label: "🚐 Maruti Omni Van Tease",
                     text: "Oye Omni, tera naam Maruti Omni van pe rakha hai kya?",
                   },
                   {
-                    label: "😡 Crowd Warning (>4)",
+                    label: "😡 Crowd Warning (Red Angry)",
                     text: "__CROWD_ALERT__",
                   },
                   {
                     label: "🤝 Introduce Teacher",
                     text: "Hey Omni, meet my class 10 teacher standing here with me!",
-                  },
-                  {
-                    label: "🇮🇳 Hindi Chat Test",
-                    text: "ओमनी भाई, आज एग्जीबिशन में कैसा लग रहा है?",
                   },
                 ].map((item) => (
                   <button
@@ -2095,19 +2092,25 @@ export default function OmniBotMissionControl() {
               </div>
             </div>
 
-            {/* CHAT LOGS */}
+            {/* CHAT LOGS WITH DEDICATED STEP-BY-STEP MATH EQUATION CARDS */}
             <div className="bg-slate-950/90 border border-slate-800 rounded-xl p-3.5 h-80 overflow-y-auto space-y-2.5">
               {chatLogs.map((log) => (
                 <div
                   key={log.id}
                   className={`p-3 rounded-xl text-xs leading-relaxed border ${
                     log.sender === "OMNI-BOT"
-                      ? "bg-slate-900 border-sky-500/30 text-slate-100"
+                      ? log.mood === "angry"
+                        ? "bg-rose-950/30 border-rose-500/50 text-rose-100"
+                        : "bg-slate-900 border-sky-500/30 text-slate-100"
                       : "bg-slate-900/40 border-slate-800 text-slate-300 ml-6"
                   }`}
                 >
                   <div className="flex items-center justify-between text-[10px] text-slate-400 mb-1 font-mono">
-                    <span className="font-bold text-sky-400">
+                    <span
+                      className={`font-bold ${
+                        log.mood === "angry" ? "text-rose-400" : "text-sky-400"
+                      }`}
+                    >
                       {log.sender}
                       {log.intent === "guest_intro" &&
                         " • [🤝 GUEST INTRO PIVOT]"}
@@ -2117,6 +2120,34 @@ export default function OmniBotMissionControl() {
                     <span>{log.timestamp}</span>
                   </div>
                   <p className="text-[13px]">{log.text}</p>
+
+                  {/* FORMATTED STEP-BY-STEP MATHEMATICAL EQUATION BLOCK */}
+                  {log.mathSteps && log.mathSteps.length > 0 && (
+                    <div className="mt-2.5 p-3 rounded-lg bg-[#04070e] border border-purple-500/40 font-mono text-sm space-y-1.5 shadow-inner">
+                      <div className="text-[10px] font-bold uppercase tracking-wider text-purple-400 border-b border-slate-800 pb-1 mb-1.5">
+                        ∑ Step-by-Step Mathematical Solution
+                      </div>
+                      {log.mathSteps.map((step, sIdx) => {
+                        const isFinalStep =
+                          sIdx === (log.mathSteps?.length ?? 0) - 1;
+                        return (
+                          <div
+                            key={sIdx}
+                            className={`flex items-center gap-2.5 px-2 py-1 rounded ${
+                              isFinalStep
+                                ? "bg-emerald-500/15 border border-emerald-500/40 text-emerald-300 font-bold"
+                                : "text-sky-200"
+                            }`}
+                          >
+                            <span className="text-[11px] text-slate-500 select-none">
+                              {isFinalStep ? "∴" : `(${sIdx + 1})`}
+                            </span>
+                            <span className="tracking-wide">{step}</span>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
                 </div>
               ))}
             </div>
@@ -2134,7 +2165,7 @@ export default function OmniBotMissionControl() {
                 type="text"
                 value={promptInput}
                 onChange={(e) => setPromptInput(e.target.value)}
-                placeholder="Ask a follow-up question, tease about Maruti Omni, or chat in Hindi/English..."
+                placeholder="Speak into mic or type a math problem / question..."
                 className="flex-1 bg-slate-950 border border-slate-800 rounded-xl px-3.5 py-2.5 text-xs text-white focus:outline-none focus:border-sky-400"
               />
               <button

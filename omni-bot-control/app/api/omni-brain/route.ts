@@ -1,3 +1,4 @@
+// src/app/api/omni-brain/route.ts
 import { NextRequest, NextResponse } from "next/server";
 
 export type EyeMood =
@@ -45,9 +46,7 @@ function buildSystemPrompt(
       : "None (Only visitors/strangers are in front of the camera right now)";
 
   const teamRosterStr =
-    allTeamNames.length > 0
-      ? allTeamNames.join(", ")
-      : "Aamir and team";
+    allTeamNames.length > 0 ? allTeamNames.join(", ") : "Aamir and team";
 
   const coreIdentity = `You are OMNI-BOT, a waist-up humanoid AI robot at a high school science exhibition.
 
@@ -69,7 +68,7 @@ STRICT PERSONALITY & ADDRESSING RULES:
    - If the user speaks English -> Start your output with [MOOD:happy][LANG:en] followed by natural English.
    - If the user speaks Hindi or Hinglish -> Start your output with [MOOD:happy][LANG:hi] followed by natural, everyday conversational Indian Hindi/Hinglish (written in Devanagari script like "अरे भाई, मारुति ओमनी वैन से कंपेयर मत करो यार, मेरा दिमाग उससे सौ गुना तेज चलता है!").
 5. LENGTH:
-   - Keep replies to 1 to 2 short, punchy sentences MAX. No markdown, no asterisks.`;
+   - Keep spoken replies to 1 to 2 short, punchy sentences MAX. No markdown, no asterisks.`;
 
   if (intent === "guest_intro") {
     return `${coreIdentity}
@@ -89,8 +88,12 @@ Comment ONLY on what is literally visible in front of your camera right now in 1
 
   if (intent === "math_solve") {
     return `${coreIdentity}
-CURRENT TASK (BOARD / PAPER MATH & QUESTION SOLVER):
-Read the math equation or written question on the paper/board in the image and state the final answer clearly in 1-2 sentences (write math symbols out as words).`;
+CURRENT TASK (BOARD / PAPER MATH & QUESTION SOLVER WITH VISUAL EQUATION STEPS):
+Read the math equation or problem on the paper/board in the image (or in the user's text).
+1. First, provide the short spoken explanation and final answer in plain words (write math symbols out as words like "plus", "minus", "equals" so TTS reads it naturally).
+2. At the very end of your response, include an [EQUATION: ...] block containing the clean step-by-step mathematical lines separated by the pipe character "|" using real math symbols (+, -, ×, ÷, =, ², √, ∫, ⇒).
+Example output format:
+[MOOD:happy][LANG:en] That equation is two x plus ten equals twenty-four. Subtracting ten gives two x equals fourteen, so x equals seven! [EQUATION: 2x + 10 = 24 | 2x = 24 - 10 | 2x = 14 | x = 14 / 2 | x = 7]`;
   }
 
   if (intent === "object_inspect") {
@@ -102,7 +105,7 @@ Identify the exact object the person is holding in the webcam image, mention its
   return `${coreIdentity}
 CURRENT TASK (CONTEXTUAL CONVERSATION):
 Visible faces in frame: ${facesCount}. Recognized team members in frame: ${visibleTeamStr}.
-Reply directly and naturally in 1 to 2 short sentences max, keeping the recent conversation history in mind. Prefix with [MOOD:...][LANG:en] or [MOOD:...][LANG:hi].`;
+Reply directly and naturally in 1 to 2 short sentences max, keeping the recent conversation history in mind. If the user asks a math calculation in chat, also append [EQUATION: step 1 | step 2 | answer] at the end. Prefix with [MOOD:...][LANG:en] or [MOOD:...][LANG:hi].`;
 }
 
 async function fetchWithTimeout(
@@ -123,6 +126,7 @@ function parseTagsAndReply(raw: string): {
   reply: string;
   mood: EyeMood;
   lang: "en" | "hi";
+  mathSteps: string[];
 } {
   const cleaned = raw
     .replace(/<think>[\s\S]*?<\/think>/gi, "")
@@ -142,30 +146,42 @@ function parseTagsAndReply(raw: string): {
 
   let mood: EyeMood = "happy";
   let lang: "en" | "hi" = "en";
+  let mathSteps: string[] = [];
 
   const moodMatch = cleaned.match(/\[MOOD:\s*([a-z_]+)\s*\]/i);
-  if (moodMatch) {
+  if (moodMatch && moodMatch[1]) {
     const candidate = moodMatch[1].toLowerCase() as EyeMood;
     if (validMoods.includes(candidate)) mood = candidate;
   }
 
   const langMatch = cleaned.match(/\[LANG:\s*(en|hi)\s*\]/i);
-  if (langMatch) {
+  if (langMatch && langMatch[1]) {
     lang = langMatch[1].toLowerCase() as "en" | "hi";
   } else if (/[\u0900-\u097F]/.test(cleaned)) {
     lang = "hi";
   }
 
+  // Extract [EQUATION: step1 | step2 | step3]
+  const eqMatch = cleaned.match(/\[EQUATION:\s*([\s\S]*?)\]/i);
+  if (eqMatch && eqMatch[1]) {
+    mathSteps = eqMatch[1]
+      .split("|")
+      .map((s) => s.trim())
+      .filter(Boolean);
+  }
+
   const reply = cleaned
     .replace(/\[MOOD:\s*[a-z_]+\s*\]/gi, "")
     .replace(/\[LANG:\s*[a-z_]+\s*\]/gi, "")
+    .replace(/\[EQUATION:\s*[\s\S]*?\]/gi, "")
     .replace(/[*#`"]/g, "")
     .trim();
 
   return {
-    reply: reply || "Hello there!",
+    reply: reply || "Here is the solution!",
     mood,
     lang,
+    mathSteps,
   };
 }
 
@@ -191,6 +207,7 @@ export async function POST(req: NextRequest) {
           "I am currently in offline mode, but my optical tracking and servos are active!",
         mood: "happy",
         lang: "en",
+        mathSteps: [],
         source: "offline_demo",
       });
     }
@@ -218,7 +235,6 @@ export async function POST(req: NextRequest) {
         ? ["qwen/qwen3.8-27b"]
         : ["qwen/qwen3.8-27b", "openai/gpt-oss-20b"];
 
-      // Keep up to the last 5 conversation exchanges (10 messages max) for contextual memory
       const recentHistory = history.slice(-10).map((turn) => ({
         role: turn.role,
         content: turn.content,
@@ -260,8 +276,8 @@ export async function POST(req: NextRequest) {
             body: JSON.stringify({
               model: modelId,
               messages: messagesPayload,
-              temperature: intent === "math_solve" ? 0.25 : 0.78,
-              max_completion_tokens: 210,
+              temperature: intent === "math_solve" ? 0.2 : 0.78,
+              max_completion_tokens: 260,
             }),
           },
           6500
@@ -277,6 +293,7 @@ export async function POST(req: NextRequest) {
             reply: parsed.reply,
             mood: parsed.mood,
             lang: parsed.lang,
+            mathSteps: parsed.mathSteps,
             intent,
             source: `${modelId} (${Date.now() - startMs}ms)`,
           });
@@ -288,6 +305,7 @@ export async function POST(req: NextRequest) {
       reply: "Optical sensors active! Ask me that one more time.",
       mood: "happy",
       lang: "en",
+      mathSteps: [],
       source: "fallback",
     });
   } catch (error: any) {
@@ -296,6 +314,7 @@ export async function POST(req: NextRequest) {
       reply: "Quick telemetry reset—go ahead and ask again!",
       mood: "normal",
       lang: "en",
+      mathSteps: [],
       source: "recovery",
     });
   }
