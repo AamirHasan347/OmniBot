@@ -60,7 +60,7 @@ const DEFAULT_TEAM_ROSTER: TeamMemberProfile[] = [
 
 function euclideanDistance128(
   descA: number[],
-  descB: Float32Array | number[]
+  descB: Float32Array | number[],
 ): number {
   if (descA.length !== descB.length) return 999;
   let sum = 0;
@@ -108,9 +108,7 @@ function parsePhysicalVoiceReflex(transcript: string): {
       targetAngle: 35,
       mood: "surprised",
       pureCommandReply:
-        lower.split(" ").length <= 6
-          ? "Looking to my right now!"
-          : undefined,
+        lower.split(" ").length <= 6 ? "Looking to my right now!" : undefined,
     };
   }
 
@@ -223,15 +221,14 @@ export default function OmniBotMissionControl() {
   // 1. CONNECTION, TELEMETRY & TEAM ROSTER STATE
   // ---------------------------------------------------------------------------
   const [wsUrl, setWsUrl] = useState<string>(
-    process.env.NEXT_PUBLIC_ESP32_WS_URL || "ws://192.168.10.44:81"
+    process.env.NEXT_PUBLIC_ESP32_WS_URL || "ws://192.168.10.44:81",
   );
   const [chatterboxUrl, setChatterboxUrl] = useState<string>(
-    "http://127.0.0.1:4123/tts"
+    "http://127.0.0.1:4123/tts",
   );
   const [wsConnected, setWsConnected] = useState<boolean>(false);
-  const [ttsEngineStatus, setTtsEngineStatus] = useState<string>(
-    "Neural TTS (4123)"
-  );
+  const [ttsEngineStatus, setTtsEngineStatus] =
+    useState<string>("Neural TTS (4123)");
   const [showDebugDrawer, setShowDebugDrawer] = useState<boolean>(false);
   const [customApiKey, setCustomApiKey] = useState<string>("");
 
@@ -241,7 +238,7 @@ export default function OmniBotMissionControl() {
 
   const [wsPacketsSent, setWsPacketsSent] = useState<number>(0);
   const [lastWsPayload, setLastWsPayload] = useState<string>(
-    '{"pan":90,"mood":"normal","volume":0}'
+    '{"pan":90,"mood":"normal","volume":0}',
   );
   const [lastAiLatency, setLastAiLatency] = useState<number>(0);
 
@@ -254,8 +251,9 @@ export default function OmniBotMissionControl() {
   const [autoTrackFace, setAutoTrackFace] = useState<boolean>(true);
   const [passiveLifeHabits, setPassiveLifeHabits] = useState<boolean>(true);
   const [crowdControlEnabled, setCrowdControlEnabled] = useState<boolean>(true);
+  // Enabled by default! Every 28s of silence, Omni-Bot comments on the live camera feed:
   const [spontaneousMonologue, setSpontaneousMonologue] =
-    useState<boolean>(false);
+    useState<boolean>(true);
   const [invertPanDirection, setInvertPanDirection] = useState<boolean>(false);
   const [offlineMode, setOfflineMode] = useState<boolean>(false);
 
@@ -279,7 +277,7 @@ export default function OmniBotMissionControl() {
   const [micVolumeLevel, setMicVolumeLevel] = useState<number>(0);
   const [isRecordingSpeech, setIsRecordingSpeech] = useState<boolean>(false);
   const [micStatusHint, setMicStatusHint] = useState<string>(
-    "Click 'Start Always-On Mic' — Works with Built-in MacBook Mic or Wired Mic!"
+    "Click 'Start Always-On Mic' — Works with Built-in MacBook Mic or Wired Mic!",
   );
   const [isThinking, setIsThinking] = useState<boolean>(false);
   const [isSpeaking, setIsSpeaking] = useState<boolean>(false);
@@ -310,7 +308,7 @@ export default function OmniBotMissionControl() {
 
   const teamRosterRef = useRef<TeamMemberProfile[]>(DEFAULT_TEAM_ROSTER);
   const recognizedSpatialRef = useRef<Array<{ normX: number; name: string }>>(
-    []
+    [],
   );
   const visibleTeamNamesRef = useRef<string[]>([]);
   const trackedFacesRef = useRef<TrackedFace[]>([]);
@@ -425,7 +423,7 @@ export default function OmniBotMissionControl() {
       if (!faceapi || !video || video.readyState < 2) return;
 
       const enrolledMembers = teamRosterRef.current.filter(
-        (m) => m.descriptor !== null && m.descriptor.length === 128
+        (m) => m.descriptor !== null && m.descriptor.length === 128,
       );
       if (enrolledMembers.length === 0) {
         recognizedSpatialRef.current = [];
@@ -441,7 +439,7 @@ export default function OmniBotMissionControl() {
             new faceapi.TinyFaceDetectorOptions({
               inputSize: 224,
               scoreThreshold: 0.5,
-            })
+            }),
           )
           .withFaceLandmarks(true)
           .withFaceDescriptors();
@@ -461,7 +459,7 @@ export default function OmniBotMissionControl() {
             if (!member.descriptor) continue;
             const dist = euclideanDistance128(
               member.descriptor,
-              det.descriptor
+              det.descriptor,
             );
             if (dist < bestDist) {
               bestDist = dist;
@@ -492,7 +490,7 @@ export default function OmniBotMissionControl() {
     const video = videoRef.current;
     if (!faceapi || !video || video.readyState < 2) {
       alert(
-        "Wait a second for the camera and Face ID neural net to finish loading!"
+        "Wait a second for the camera and Face ID neural net to finish loading!",
       );
       return;
     }
@@ -505,14 +503,14 @@ export default function OmniBotMissionControl() {
           new faceapi.TinyFaceDetectorOptions({
             inputSize: 320,
             scoreThreshold: 0.5,
-          })
+          }),
         )
         .withFaceLandmarks(true)
         .withFaceDescriptor();
 
       if (!detection || !detection.descriptor) {
         alert(
-          "Could not lock onto a clear face! Look directly at the camera with good lighting and click Enroll again."
+          "Could not lock onto a clear face! Look directly at the camera with good lighting and click Enroll again.",
         );
         setEnrollingSlotIdx(null);
         return;
@@ -533,13 +531,13 @@ export default function OmniBotMissionControl() {
                 role: item.role,
                 descriptor: descriptorArray,
               }
-            : item
+            : item,
         );
         teamRosterRef.current = updated;
         try {
           localStorage.setItem(
             "omnibot_team_roster_v2",
-            JSON.stringify(updated)
+            JSON.stringify(updated),
           );
         } catch {
           // Ignore
@@ -564,13 +562,13 @@ export default function OmniBotMissionControl() {
                 role: item.role,
                 descriptor: item.descriptor,
               }
-            : item
+            : item,
         );
         teamRosterRef.current = updated;
         try {
           localStorage.setItem(
             "omnibot_team_roster_v2",
-            JSON.stringify(updated)
+            JSON.stringify(updated),
           );
         } catch {
           // Ignore
@@ -578,7 +576,7 @@ export default function OmniBotMissionControl() {
         return updated;
       });
     },
-    []
+    [],
   );
 
   const clearTeamMemberSlot = useCallback((slotIndex: number) => {
@@ -591,7 +589,7 @@ export default function OmniBotMissionControl() {
               role: item.role,
               descriptor: null,
             }
-          : item
+          : item,
       );
       teamRosterRef.current = updated;
       try {
@@ -630,7 +628,7 @@ export default function OmniBotMissionControl() {
   const updateTelemetry = useCallback(
     (
       partial: Partial<{ pan: number; mood: EyeMood; volume: number }>,
-      instant = false
+      instant = false,
     ) => {
       if (partial.pan !== undefined) {
         const clampedPan = Math.max(20, Math.min(160, Math.round(partial.pan)));
@@ -644,7 +642,7 @@ export default function OmniBotMissionControl() {
       if (partial.volume !== undefined) {
         const clampedVol = Math.max(
           0,
-          Math.min(16, Math.round(partial.volume))
+          Math.min(16, Math.round(partial.volume)),
         );
         telemetryRef.current.volume = clampedVol;
         setVuVolume(clampedVol);
@@ -657,7 +655,7 @@ export default function OmniBotMissionControl() {
         sendNowIfChanged(true);
       }
     },
-    [sendNowIfChanged]
+    [sendNowIfChanged],
   );
 
   const connectWebSocket = useCallback(() => {
@@ -848,7 +846,7 @@ export default function OmniBotMissionControl() {
           const wave = Math.abs(Math.sin(tick * 0.45)) * 10 + Math.random() * 5;
           updateTelemetry(
             { volume: Math.min(16, Math.max(3, Math.round(wave))) },
-            true
+            true,
           );
         }, 60);
 
@@ -866,7 +864,7 @@ export default function OmniBotMissionControl() {
         window.speechSynthesis.speak(utterance);
       });
     },
-    [chatterboxUrl, updateTelemetry]
+    [chatterboxUrl, updateTelemetry],
   );
 
   const speakWithChatterbox = useCallback(
@@ -888,7 +886,7 @@ export default function OmniBotMissionControl() {
       isSpeakingRef.current = false;
       updateTelemetry({ volume: 0, mood: "normal" }, true);
     },
-    [playSingleTtsSegment, updateTelemetry]
+    [playSingleTtsSegment, updateTelemetry],
   );
 
   const executeCrowdControlAlert = useCallback(async () => {
@@ -924,11 +922,7 @@ export default function OmniBotMissionControl() {
     ]);
 
     updateTelemetry({ pan: crowdAngle, mood: "angry" }, true);
-    await playSingleTtsSegment(
-      "हाँ आओ ना, घुस जाओ मेरे अंदर!",
-      "angry",
-      "hi"
-    );
+    await playSingleTtsSegment("हाँ आओ ना, घुस जाओ मेरे अंदर!", "angry", "hi");
 
     updateTelemetry({ mood: "angry", volume: 0 }, true);
     await new Promise((r) => setTimeout(r, 2000));
@@ -937,7 +931,7 @@ export default function OmniBotMissionControl() {
 
     updateTelemetry(
       { pan: primarySpeakerAngle, mood: "normal", volume: 0 },
-      true
+      true,
     );
     setIsSpeaking(false);
     isSpeakingRef.current = false;
@@ -951,7 +945,7 @@ export default function OmniBotMissionControl() {
     async function loadMediaPipe() {
       try {
         const vision = await FilesetResolver.forVisionTasks(
-          "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm"
+          "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm",
         );
         const detector = await FaceDetector.createFromOptions(vision, {
           baseOptions: {
@@ -1075,8 +1069,8 @@ export default function OmniBotMissionControl() {
               const color = matchedName
                 ? "#34d399"
                 : idx === 0
-                ? "#38bdf8"
-                : "#fbbf24";
+                  ? "#38bdf8"
+                  : "#fbbf24";
               ctx.strokeStyle = color;
               ctx.lineWidth = idx === 0 ? 2.5 : 2;
               ctx.strokeRect(box.originX, box.originY, box.width, box.height);
@@ -1085,16 +1079,16 @@ export default function OmniBotMissionControl() {
               ctx.font = "bold 11px monospace";
               const tagLabel = matchedName
                 ? `TEAM: ${matchedName.toUpperCase()} • ${Math.round(
-                    mappedAngle
+                    mappedAngle,
                   )}°`
                 : idx === 0
-                ? `SPEAKER #1 • ${Math.round(mappedAngle)}°`
-                : `CROWD #${idx + 1} • ${Math.round(mappedAngle)}°`;
+                  ? `SPEAKER #1 • ${Math.round(mappedAngle)}°`
+                  : `CROWD #${idx + 1} • ${Math.round(mappedAngle)}°`;
 
               ctx.fillText(
                 tagLabel,
                 box.originX,
-                Math.max(14, box.originY - 6)
+                Math.max(14, box.originY - 6),
               );
 
               ctx.beginPath();
@@ -1147,14 +1141,12 @@ export default function OmniBotMissionControl() {
       if (roll < 0.2) {
         updateTelemetry({ mood: "happy" }, true);
         setTimeout(() => {
-          if (!isSpeakingRef.current)
-            updateTelemetry({ mood: "normal" }, true);
+          if (!isSpeakingRef.current) updateTelemetry({ mood: "normal" }, true);
         }, 1800);
       } else if (roll < 0.32) {
         updateTelemetry({ mood: "wink_left" }, true);
         setTimeout(() => {
-          if (!isSpeakingRef.current)
-            updateTelemetry({ mood: "normal" }, true);
+          if (!isSpeakingRef.current) updateTelemetry({ mood: "normal" }, true);
         }, 850);
       }
     }, 6500);
@@ -1170,20 +1162,17 @@ export default function OmniBotMissionControl() {
       if (!video || video.readyState < 2) return null;
 
       const offscreen = document.createElement("canvas");
-      const targetW = intent === "math_solve" ? 640 : 480;
-      const targetH = intent === "math_solve" ? 480 : 360;
+      const targetW = 480;
+      const targetH = 360;
       offscreen.width = targetW;
       offscreen.height = targetH;
 
       const ctx = offscreen.getContext("2d");
       if (!ctx) return null;
       ctx.drawImage(video, 0, 0, targetW, targetH);
-      return offscreen.toDataURL(
-        "image/jpeg",
-        intent === "math_solve" ? 0.85 : 0.68
-      );
+      return offscreen.toDataURL("image/jpeg", 0.6);
     },
-    []
+    [],
   );
 
   // ---------------------------------------------------------------------------
@@ -1200,10 +1189,7 @@ export default function OmniBotMissionControl() {
         const reflex = parsePhysicalVoiceReflex(cleanPrompt);
         if (reflex.targetAngle !== null) {
           manualNeckHoldUntilRef.current = Date.now() + 5500;
-          updateTelemetry(
-            { pan: reflex.targetAngle, mood: reflex.mood },
-            true
-          );
+          updateTelemetry({ pan: reflex.targetAngle, mood: reflex.mood }, true);
 
           if (reflex.pureCommandReply) {
             const replyText = reflex.pureCommandReply;
@@ -1251,7 +1237,7 @@ export default function OmniBotMissionControl() {
             manualNeckHoldUntilRef.current = Date.now() + 8000;
             updateTelemetry(
               { pan: speakerFace.panAngle, mood: "surprised" },
-              true
+              true,
             );
             guestTargetAngle = guestFace.panAngle;
           }
@@ -1264,13 +1250,13 @@ export default function OmniBotMissionControl() {
           {
             mood: resolvedIntent === "math_solve" ? "surprised" : "suspicious",
           },
-          true
+          true,
         );
       }
 
       const chronologicalHistory = [...chatLogsRef.current]
         .filter((l) => l.id !== "init-1")
-        .slice(0, 10)
+        .slice(0, 3)
         .reverse()
         .map((l) => ({
           role: (l.sender === "USER" ? "user" : "assistant") as
@@ -1355,23 +1341,25 @@ export default function OmniBotMissionControl() {
       captureFrameForIntent,
       speakWithChatterbox,
       updateTelemetry,
-    ]
+    ],
   );
 
+  // Live Camera Feed Commentary Loop (Triggers every 25s of silence when enabled)
   useEffect(() => {
     if (!spontaneousMonologue) return;
     const timer = setInterval(() => {
       if (isSpeakingRef.current || isThinkingRef.current) return;
       if (
         lastInteractionMsRef.current > 0 &&
-        Date.now() - lastInteractionMsRef.current >= 30000
+        Date.now() - lastInteractionMsRef.current >= 60000 &&
+  facesCountRef.current >= 1 
       ) {
         triggerOmniBrain(
-          "Make a short observation about what is happening in front of your camera right now.",
-          "autonomous_idle"
+          "Look at the live webcam feed right now and make a spontaneous, witty observation about the person, crowd, or scene in front of you.",
+          "autonomous_idle",
         );
       }
-    }, 5000);
+    }, 3000);
     return () => clearInterval(timer);
   }, [spontaneousMonologue, triggerOmniBrain]);
 
@@ -1488,7 +1476,7 @@ export default function OmniBotMissionControl() {
       micActiveRef.current = true;
       setMicActive(true);
       setMicStatusHint(
-        "Always-On Mic Active — Speak into your MacBook or Collar Mic!"
+        "Always-On Mic Active — Speak into your MacBook or Collar Mic!",
       );
 
       const monitorVoiceActivity = () => {
@@ -1551,7 +1539,7 @@ export default function OmniBotMissionControl() {
     } catch (err: any) {
       console.error("Mic start error:", err);
       setMicStatusHint(
-        "Microphone blocked! Click the camera/mic icon in Chrome's address bar to Allow."
+        "Microphone blocked! Click the camera/mic icon in Chrome's address bar to Allow.",
       );
       setMicActive(false);
     }
@@ -1586,12 +1574,12 @@ export default function OmniBotMissionControl() {
     const eyeColor = isAngryMode
       ? "bg-rose-500 shadow-[0_0_20px_#f43f5e]"
       : currentMood === "love"
-      ? "bg-pink-400 shadow-[0_0_16px_#f472b6]"
-      : currentMood === "scared"
-      ? "bg-purple-400 shadow-[0_0_14px_#c084fc]"
-      : currentMood === "dizzy"
-      ? "bg-amber-400 shadow-[0_0_14px_#fbbf24]"
-      : "bg-sky-400 shadow-[0_0_16px_#38bdf8]";
+        ? "bg-pink-400 shadow-[0_0_16px_#f472b6]"
+        : currentMood === "scared"
+          ? "bg-purple-400 shadow-[0_0_14px_#c084fc]"
+          : currentMood === "dizzy"
+            ? "bg-amber-400 shadow-[0_0_14px_#fbbf24]"
+            : "bg-sky-400 shadow-[0_0_16px_#38bdf8]";
 
     if (
       (currentMood === "wink_left" && isLeft) ||
@@ -1704,8 +1692,8 @@ export default function OmniBotMissionControl() {
                 isAngryMode
                   ? "bg-rose-500 shadow-[0_0_14px_#f43f5e] animate-ping"
                   : wsConnected
-                  ? "bg-emerald-400 shadow-[0_0_12px_#34d399]"
-                  : "bg-rose-500 animate-pulse"
+                    ? "bg-emerald-400 shadow-[0_0_12px_#34d399]"
+                    : "bg-rose-500 animate-pulse"
               }`}
             />
             <div className="flex flex-wrap items-center gap-2">
@@ -1731,7 +1719,8 @@ export default function OmniBotMissionControl() {
               PAN: <strong className="text-sky-400">{panAngle}°</strong>
             </div>
             <div className="px-3 py-1 rounded-lg bg-slate-950 border border-slate-800">
-              AI: <strong className="text-emerald-400">{lastAiLatency}ms</strong>
+              AI:{" "}
+              <strong className="text-emerald-400">{lastAiLatency}ms</strong>
             </div>
 
             <button
@@ -1839,7 +1828,7 @@ export default function OmniBotMissionControl() {
               <div className="grid grid-cols-1 sm:grid-cols-5 gap-2.5">
                 {teamRoster.map((member, idx) => {
                   const isEnrolled = Boolean(
-                    member.descriptor && member.descriptor.length === 128
+                    member.descriptor && member.descriptor.length === 128,
                   );
                   return (
                     <div
@@ -1877,8 +1866,8 @@ export default function OmniBotMissionControl() {
                           {enrollingSlotIdx === idx
                             ? "Scanning..."
                             : isEnrolled
-                            ? "↻ Re-Scan"
-                            : "📸 Enroll"}
+                              ? "↻ Re-Scan"
+                              : "📸 Enroll"}
                         </button>
                         {isEnrolled && (
                           <button
@@ -1963,7 +1952,7 @@ export default function OmniBotMissionControl() {
                   onClick={() =>
                     triggerOmniBrain(
                       "Can you see and tell me what I am holding in my hand right now?",
-                      "object_inspect"
+                      "object_inspect",
                     )
                   }
                   disabled={isThinking}
@@ -1975,7 +1964,7 @@ export default function OmniBotMissionControl() {
                   onClick={() =>
                     triggerOmniBrain(
                       "Read the math equation or question written on this paper/board and solve it step by step!",
-                      "math_solve"
+                      "math_solve",
                     )
                   }
                   disabled={isThinking}
@@ -1987,7 +1976,7 @@ export default function OmniBotMissionControl() {
                   onClick={() =>
                     triggerOmniBrain(
                       "Hey Omni, meet our special guest and teacher standing right here with me!",
-                      "guest_intro"
+                      "guest_intro",
                     )
                   }
                   disabled={isThinking}
@@ -2095,10 +2084,10 @@ export default function OmniBotMissionControl() {
                           isAngryMode
                             ? "bg-rose-500 shadow-[0_0_8px_#f43f5e]"
                             : idx < vuVolume
-                            ? idx >= 12
-                              ? "bg-fuchsia-400"
-                              : "bg-sky-400"
-                            : "bg-slate-800"
+                              ? idx >= 12
+                                ? "bg-fuchsia-400"
+                                : "bg-sky-400"
+                              : "bg-slate-800"
                         }`}
                       />
                     ))}
@@ -2185,15 +2174,15 @@ export default function OmniBotMissionControl() {
                     isRecordingSpeech
                       ? "bg-rose-500/30 border-rose-400 text-rose-200 animate-pulse"
                       : micActive
-                      ? "bg-emerald-500/20 border-emerald-400 text-emerald-200"
-                      : "bg-sky-400 hover:bg-sky-300 text-slate-950 border-transparent"
+                        ? "bg-emerald-500/20 border-emerald-400 text-emerald-200"
+                        : "bg-sky-400 hover:bg-sky-300 text-slate-950 border-transparent"
                   }`}
                 >
                   {isRecordingSpeech
                     ? "🎙️ HEARING YOU SPEAK... (PAUSE 1s TO SEND)"
                     : micActive
-                    ? "🎙️ ALWAYS-ON MIC ACTIVE (MACBOOK OR COLLAR MIC — CLICK TO PAUSE)"
-                    : "🎙️ START ALWAYS-ON MIC (GROQ WHISPER VAD)"}
+                      ? "🎙️ ALWAYS-ON MIC ACTIVE (MACBOOK OR COLLAR MIC — CLICK TO PAUSE)"
+                      : "🎙️ START ALWAYS-ON MIC (GROQ WHISPER VAD)"}
                 </button>
 
                 {/* Live Hardware Audio Level Bar */}
@@ -2201,7 +2190,9 @@ export default function OmniBotMissionControl() {
                   <div className="w-32 h-2 bg-slate-950 rounded-full overflow-hidden border border-slate-800">
                     <div
                       className={`h-full transition-all duration-75 ${
-                        micVolumeLevel >= 18 ? "bg-emerald-400" : "bg-sky-500/50"
+                        micVolumeLevel >= 18
+                          ? "bg-emerald-400"
+                          : "bg-sky-500/50"
                       }`}
                       style={{ width: `${micVolumeLevel}%` }}
                     />
