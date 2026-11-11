@@ -11,7 +11,11 @@ type EyeMood =
   | "wink_left"
   | "wink_right"
   | "angry"
-  | "surprised";
+  | "surprised"
+  | "crying"
+  | "scared"
+  | "love"
+  | "dizzy";
 
 type TaskIntent =
   | "chat"
@@ -118,7 +122,7 @@ function parsePhysicalVoiceReflex(transcript: string): {
   ) {
     return {
       targetAngle: 158,
-      mood: "suspicious",
+      mood: "dizzy",
       pureCommandReply:
         "My neck servo maxes out at one-sixty degrees—any further and I will unscrew my own head!",
     };
@@ -265,16 +269,17 @@ export default function OmniBotMissionControl() {
   const [selectedMicId, setSelectedMicId] = useState<string>("");
 
   // ---------------------------------------------------------------------------
-  // 3. VISION, MIC & AI PIPELINE STATE
+  // 3. VISION, GROQ WHISPER VAD MIC & AI PIPELINE STATE
   // ---------------------------------------------------------------------------
   const [visionReady, setVisionReady] = useState<boolean>(false);
   const [fps, setFps] = useState<number>(0);
   const [facesDetected, setFacesDetected] = useState<number>(0);
 
   const [micActive, setMicActive] = useState<boolean>(false);
-  const [liveHeardWords, setLiveHeardWords] = useState<string>("");
+  const [micVolumeLevel, setMicVolumeLevel] = useState<number>(0);
+  const [isRecordingSpeech, setIsRecordingSpeech] = useState<boolean>(false);
   const [micStatusHint, setMicStatusHint] = useState<string>(
-    "Click 'Activate Continuous Mic' once to start talking"
+    "Click 'Start Always-On Mic' — Works with Built-in MacBook Mic or Wired Mic!"
   );
   const [isThinking, setIsThinking] = useState<boolean>(false);
   const [isSpeaking, setIsSpeaking] = useState<boolean>(false);
@@ -286,7 +291,7 @@ export default function OmniBotMissionControl() {
     {
       id: "init-1",
       sender: "OMNI-BOT",
-      text: "Systems online! Mathematical equation rendering, continuous voice recognition, and crimson red angry mode are ready.",
+      text: "Systems online! Added Crying, Scared, Love, and Dizzy emotes, Red Angry Eye/Ring Overdrive, and Groq Whisper Hardware Mic!",
       mood: "normal",
       intent: "chat",
       timestamp: "READY",
@@ -324,7 +329,8 @@ export default function OmniBotMissionControl() {
 
   const autoTrackRef = useRef<boolean>(true);
   const invertPanRef = useRef<boolean>(false);
-  const micWantedRef = useRef<boolean>(false);
+  const micActiveRef = useRef<boolean>(false);
+  const micLangRef = useRef<"en-IN" | "hi-IN">("en-IN");
   const crowdControlEnabledRef = useRef<boolean>(true);
   const isSpeakingRef = useRef<boolean>(false);
   const isThinkingRef = useRef<boolean>(false);
@@ -335,9 +341,13 @@ export default function OmniBotMissionControl() {
   const facesCountRef = useRef<number>(0);
   const lastInteractionMsRef = useRef<number>(0);
   const speakingTimerRef = useRef<NodeJS.Timeout | null>(null);
-  const recognitionRef = useRef<any>(null);
-  const silenceTimerRef = useRef<NodeJS.Timeout | null>(null);
-  const accumulatedTranscriptRef = useRef<string>("");
+
+  // Hardware Audio Stream & VAD Recorder Refs
+  const micStreamRef = useRef<MediaStream | null>(null);
+  const micAudioCtxRef = useRef<AudioContext | null>(null);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const audioChunksRef = useRef<Blob[]>([]);
+  const vadAnimFrameRef = useRef<number | null>(null);
 
   useEffect(() => {
     chatLogsRef.current = chatLogs;
@@ -346,6 +356,10 @@ export default function OmniBotMissionControl() {
   useEffect(() => {
     teamRosterRef.current = teamRoster;
   }, [teamRoster]);
+
+  useEffect(() => {
+    micLangRef.current = micLang;
+  }, [micLang]);
 
   useEffect(() => {
     lastInteractionMsRef.current = Date.now();
@@ -689,7 +703,7 @@ export default function OmniBotMissionControl() {
     try {
       const tempStream = await navigator.mediaDevices.getUserMedia({
         video: true,
-        audio: false,
+        audio: true,
       });
       tempStream.getTracks().forEach((t) => t.stop());
 
@@ -710,11 +724,9 @@ export default function OmniBotMissionControl() {
         }
       }
       if (!selectedMicId && mics.length > 0) {
-        const usbMic = mics.find((m) => m.label.toLowerCase().includes("usb"));
+        // Default to Built-in MacBook Mic or USB Mic automatically
         const firstMic = mics[0];
-        if (usbMic) {
-          setSelectedMicId(usbMic.deviceId);
-        } else if (firstMic) {
+        if (firstMic) {
           setSelectedMicId(firstMic.deviceId);
         }
       }
@@ -879,7 +891,6 @@ export default function OmniBotMissionControl() {
     [playSingleTtsSegment, updateTelemetry]
   );
 
-  // SPECIAL EVENT: >4 People Crowd Control Choreography (Turns Ring & Eyes Red!)
   const executeCrowdControlAlert = useCallback(async () => {
     if (isSpeakingRef.current || isThinkingRef.current) return;
     lastCrowdAlertMsRef.current = Date.now();
@@ -919,7 +930,6 @@ export default function OmniBotMissionControl() {
       "hi"
     );
 
-    // 2-Second Dramatic Silence with Crimson Red Ring & Angry Eyes!
     updateTelemetry({ mood: "angry", volume: 0 }, true);
     await new Promise((r) => setTimeout(r, 2000));
 
@@ -1366,167 +1376,194 @@ export default function OmniBotMissionControl() {
   }, [spontaneousMonologue, triggerOmniBrain]);
 
   // ---------------------------------------------------------------------------
-  // 12. ROCK-SOLID CONTINUOUS MICROPHONE ENGINE (ZERO BLINKING + SILENCE COMMIT)
+  // 12. HARDWARE VAD + GROQ WHISPER MIC ENGINE (NEVER CRASHES OR BLINKS!)
   // ---------------------------------------------------------------------------
-  const initContinuousMic = useCallback(() => {
-    if (typeof window === "undefined") return;
-    const SpeechRecognition =
-      (window as any).SpeechRecognition ||
-      (window as any).webkitSpeechRecognition;
+  const stopHardwareMic = useCallback(() => {
+    micActiveRef.current = false;
+    setMicActive(false);
+    setIsRecordingSpeech(false);
+    setMicVolumeLevel(0);
 
-    if (!SpeechRecognition) {
-      setMicStatusHint(
-        "Browser does not support Web Speech API — Please open in Google Chrome!"
-      );
-      return;
+    if (vadAnimFrameRef.current) {
+      cancelAnimationFrame(vadAnimFrameRef.current);
+      vadAnimFrameRef.current = null;
     }
-
-    if (recognitionRef.current) {
+    if (
+      mediaRecorderRef.current &&
+      mediaRecorderRef.current.state !== "inactive"
+    ) {
       try {
-        recognitionRef.current.onend = null;
-        recognitionRef.current.stop();
+        mediaRecorderRef.current.stop();
       } catch {
         // Ignore
       }
     }
+    if (micStreamRef.current) {
+      micStreamRef.current.getTracks().forEach((t) => t.stop());
+      micStreamRef.current = null;
+    }
+    if (micAudioCtxRef.current) {
+      micAudioCtxRef.current.close().catch(() => {});
+      micAudioCtxRef.current = null;
+    }
+    setMicStatusHint("Mic Paused");
+  }, []);
 
-    const recognition = new SpeechRecognition();
-    recognition.lang = micLang;
-    // CRITICAL FIX: continuous=true prevents the mic from shutting off and blinking every 2 seconds!
-    recognition.continuous = true;
-    recognition.interimResults = true;
-    recognition.maxAlternatives = 1;
+  const startHardwareMic = useCallback(async () => {
+    try {
+      stopHardwareMic();
 
-    recognition.onstart = () => {
-      setMicActive(true);
-      setMicStatusHint(
-        `Continuous Mic Locked (${micLang}) — Speak naturally anytime!`
-      );
-    };
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: selectedMicId
+          ? {
+              deviceId: { exact: selectedMicId },
+              echoCancellation: true,
+              noiseSuppression: true,
+            }
+          : { echoCancellation: true, noiseSuppression: true },
+      });
 
-    recognition.onresult = (event: any) => {
-      // Ignore audio while Omni-Bot is speaking out loud
-      if (isSpeakingRef.current || isThinkingRef.current) {
-        accumulatedTranscriptRef.current = "";
-        return;
-      }
+      micStreamRef.current = stream;
+      const audioCtx = new AudioContext();
+      micAudioCtxRef.current = audioCtx;
+      const source = audioCtx.createMediaStreamSource(stream);
+      const analyser = audioCtx.createAnalyser();
+      analyser.fftSize = 512;
+      source.connect(analyser);
 
-      let interimTranscript = "";
-      let latestFinal = "";
+      const dataArray = new Uint8Array(analyser.frequencyBinCount);
 
-      for (let i = event.resultIndex; i < event.results.length; ++i) {
-        const res = event.results[i];
-        const chunk = res?.[0]?.transcript || "";
-        if (res?.isFinal) {
-          latestFinal += chunk + " ";
-        } else {
-          interimTranscript += chunk;
+      let speakingNow = false;
+      let silenceStartMs = 0;
+      let speechStartMs = 0;
+
+      const recorder = new MediaRecorder(stream);
+      mediaRecorderRef.current = recorder;
+
+      recorder.ondataavailable = (e) => {
+        if (e.data && e.data.size > 0) {
+          audioChunksRef.current.push(e.data);
         }
-      }
+      };
 
-      if (latestFinal) {
-        accumulatedTranscriptRef.current = (
-          accumulatedTranscriptRef.current +
-          " " +
-          latestFinal
-        ).trim();
-      }
+      recorder.onstop = async () => {
+        const chunks = audioChunksRef.current;
+        audioChunksRef.current = [];
+        if (
+          chunks.length === 0 ||
+          isSpeakingRef.current ||
+          isThinkingRef.current
+        ) {
+          return;
+        }
 
-      const combinedText = (
-        accumulatedTranscriptRef.current +
-        " " +
-        interimTranscript
-      ).trim();
+        const audioBlob = new Blob(chunks, { type: "audio/webm" });
+        if (audioBlob.size < 1800) return;
 
-      setLiveHeardWords(combinedText);
-      setPromptInput(combinedText);
+        setMicStatusHint("⚡ Transcribing voice via Groq Whisper...");
+        try {
+          const form = new FormData();
+          form.append("file", audioBlob, "speech.webm");
+          form.append("lang", micLangRef.current);
 
-      // Debounce Silence Timer: The moment you pause speaking for 1.1 seconds, fire to Omni-Bot!
-      if (silenceTimerRef.current) {
-        clearTimeout(silenceTimerRef.current);
-      }
-
-      if (combinedText.length > 1) {
-        silenceTimerRef.current = setTimeout(() => {
-          const finalToSend = (
-            accumulatedTranscriptRef.current || combinedText
-          ).trim();
-          accumulatedTranscriptRef.current = "";
-          setLiveHeardWords("");
-          setPromptInput("");
-          if (
-            finalToSend &&
-            !isSpeakingRef.current &&
-            !isThinkingRef.current
-          ) {
-            setMicStatusHint(`Sent: "${finalToSend}"`);
-            triggerOmniBrain(finalToSend);
-          }
-        }, 1100);
-      }
-    };
-
-    recognition.onerror = (event: any) => {
-      if (event.error === "not-allowed" || event.error === "service-not-allowed") {
-        micWantedRef.current = false;
-        setMicActive(false);
-        setMicStatusHint(
-          "Mic Permission Blocked! Allow Microphone in Chrome URL bar."
-        );
-      } else if (event.error !== "no-speech" && event.error !== "aborted") {
-        setMicStatusHint(`Mic note: ${event.error} (Auto-recovering...)`);
-      }
-    };
-
-    recognition.onend = () => {
-      // Only auto-restart after a calm 600ms delay if continuous mode is still wanted
-      if (micWantedRef.current) {
-        setTimeout(() => {
-          if (micWantedRef.current) {
-            try {
-              recognition.start();
-            } catch {
-              // Ignore if already started
+          const res = await fetch("/api/stt", {
+            method: "POST",
+            body: form,
+          });
+          if (res.ok) {
+            const data = await res.json();
+            const text = (data.text || "").trim();
+            if (text) {
+              setMicStatusHint(`Heard: "${text}"`);
+              triggerOmniBrain(text);
+              return;
             }
           }
-        }, 600);
-      } else {
-        setMicActive(false);
-        setMicStatusHint("Mic Paused");
-      }
-    };
+          setMicStatusHint("Listening — Speak anytime!");
+        } catch {
+          setMicStatusHint("Listening — Speak anytime!");
+        }
+      };
 
-    recognitionRef.current = recognition;
-    try {
-      recognition.start();
-    } catch {
-      // Ignore
+      micActiveRef.current = true;
+      setMicActive(true);
+      setMicStatusHint(
+        "Always-On Mic Active — Speak into your MacBook or Collar Mic!"
+      );
+
+      const monitorVoiceActivity = () => {
+        if (!micActiveRef.current || !micAudioCtxRef.current) return;
+
+        analyser.getByteFrequencyData(dataArray);
+        let sum = 0;
+        for (let i = 2; i < 45; i++) {
+          sum += dataArray[i] ?? 0;
+        }
+        const avgVolume = sum / 43;
+        const normalizedLevel = Math.min(100, Math.round(avgVolume * 1.6));
+        setMicVolumeLevel(normalizedLevel);
+
+        // Pause recording while Omni-Bot is speaking or thinking
+        if (isSpeakingRef.current || isThinkingRef.current) {
+          if (speakingNow && recorder.state === "recording") {
+            audioChunksRef.current = [];
+            recorder.stop();
+          }
+          speakingNow = false;
+          setIsRecordingSpeech(false);
+          vadAnimFrameRef.current = requestAnimationFrame(monitorVoiceActivity);
+          return;
+        }
+
+        const SPEECH_THRESHOLD = 18; // Sensitive enough for MacBook Air internal mic!
+        const now = Date.now();
+
+        if (normalizedLevel >= SPEECH_THRESHOLD) {
+          silenceStartMs = now;
+          if (!speakingNow) {
+            speakingNow = true;
+            speechStartMs = now;
+            setIsRecordingSpeech(true);
+            setMicStatusHint("🎙️ Hearing you speak...");
+            audioChunksRef.current = [];
+            if (recorder.state === "inactive") {
+              recorder.start();
+            }
+          }
+        } else if (speakingNow) {
+          // If silent for 1.05 seconds after speaking for at least 350ms -> Send to Whisper!
+          if (now - silenceStartMs >= 1050) {
+            speakingNow = false;
+            setIsRecordingSpeech(false);
+            if (now - speechStartMs >= 350 && recorder.state === "recording") {
+              recorder.stop();
+            } else if (recorder.state === "recording") {
+              audioChunksRef.current = [];
+              recorder.stop();
+            }
+          }
+        }
+
+        vadAnimFrameRef.current = requestAnimationFrame(monitorVoiceActivity);
+      };
+
+      vadAnimFrameRef.current = requestAnimationFrame(monitorVoiceActivity);
+    } catch (err: any) {
+      console.error("Mic start error:", err);
+      setMicStatusHint(
+        "Microphone blocked! Click the camera/mic icon in Chrome's address bar to Allow."
+      );
+      setMicActive(false);
     }
-  }, [micLang, triggerOmniBrain]);
+  }, [selectedMicId, stopHardwareMic, triggerOmniBrain]);
 
   const toggleMicButton = useCallback(() => {
     if (micActive) {
-      micWantedRef.current = false;
-      setMicActive(false);
-      if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
-      try {
-        recognitionRef.current?.stop();
-      } catch {
-        // Ignore
-      }
-      setMicStatusHint("Mic Paused");
+      stopHardwareMic();
     } else {
-      micWantedRef.current = true;
-      initContinuousMic();
+      startHardwareMic();
     }
-  }, [micActive, initContinuousMic]);
-
-  // Restart continuous recognition cleanly if user switches language pill (EN-IN <-> HI-IN)
-  useEffect(() => {
-    if (micWantedRef.current) {
-      initContinuousMic();
-    }
-  }, [micLang, initContinuousMic]);
+  }, [micActive, startHardwareMic, stopHardwareMic]);
 
   const moods: EyeMood[] = [
     "normal",
@@ -1536,9 +1573,119 @@ export default function OmniBotMissionControl() {
     "wink_left",
     "wink_right",
     "angry",
+    "crying",
+    "scared",
+    "love",
+    "dizzy",
   ];
 
   const isAngryMode = currentMood === "angry";
+
+  // Helper to render the Digital Dual-OLED Eye Simulator with Bright Red Angry Eyes & New Emotes
+  const renderDigitalEye = (isLeft: boolean) => {
+    const eyeColor = isAngryMode
+      ? "bg-rose-500 shadow-[0_0_20px_#f43f5e]"
+      : currentMood === "love"
+      ? "bg-pink-400 shadow-[0_0_16px_#f472b6]"
+      : currentMood === "scared"
+      ? "bg-purple-400 shadow-[0_0_14px_#c084fc]"
+      : currentMood === "dizzy"
+      ? "bg-amber-400 shadow-[0_0_14px_#fbbf24]"
+      : "bg-sky-400 shadow-[0_0_16px_#38bdf8]";
+
+    if (
+      (currentMood === "wink_left" && isLeft) ||
+      (currentMood === "wink_right" && !isLeft)
+    ) {
+      return <div className={`w-12 h-1.5 rounded-full ${eyeColor}`} />;
+    }
+
+    if (currentMood === "angry") {
+      return (
+        <div
+          className={`relative w-12 h-8 rounded-lg ${eyeColor} flex items-center justify-center animate-pulse ${
+            isLeft ? "rotate-12" : "-rotate-12"
+          }`}
+        >
+          <div className="w-3 h-3 rounded-full bg-slate-950 flex items-center justify-center">
+            <div className="w-1 h-1 rounded-full bg-rose-400" />
+          </div>
+        </div>
+      );
+    }
+
+    if (currentMood === "crying") {
+      return (
+        <div className="relative flex flex-col items-center">
+          <div
+            className={`w-12 h-7 rounded-t-xl bg-sky-400 shadow-[0_0_14px_#38bdf8] ${
+              isLeft ? "-rotate-12" : "rotate-12"
+            } flex items-center justify-center`}
+          >
+            <div className="w-3 h-3 rounded-full bg-slate-950" />
+          </div>
+          <div className="flex gap-3 mt-1 animate-bounce">
+            <span className="w-1.5 h-2.5 rounded-full bg-sky-300" />
+            <span className="w-1.5 h-2.5 rounded-full bg-sky-300" />
+          </div>
+        </div>
+      );
+    }
+
+    if (currentMood === "scared") {
+      return (
+        <div className="w-11 h-11 rounded-full border-2 border-purple-400 flex items-center justify-center animate-ping">
+          <div className="w-2 h-2 rounded-full bg-purple-300" />
+        </div>
+      );
+    }
+
+    if (currentMood === "love") {
+      return (
+        <div className="text-3xl text-pink-400 drop-shadow-[0_0_12px_#f472b6] animate-bounce select-none">
+          ♥
+        </div>
+      );
+    }
+
+    if (currentMood === "dizzy") {
+      return (
+        <div className="w-11 h-11 rounded-full border-2 border-amber-400 flex items-center justify-center font-mono font-extrabold text-xl text-amber-300 animate-spin select-none">
+          ✕
+        </div>
+      );
+    }
+
+    if (currentMood === "happy") {
+      return (
+        <div className="w-12 h-6 rounded-t-full border-t-4 border-sky-400 shadow-[0_0_12px_#38bdf8]" />
+      );
+    }
+
+    if (currentMood === "suspicious") {
+      return <div className={`w-12 h-3 rounded-md ${eyeColor}`} />;
+    }
+
+    if (currentMood === "surprised") {
+      return (
+        <div
+          className={`w-11 h-11 rounded-full ${eyeColor} flex items-center justify-center`}
+        >
+          <div className="w-2.5 h-2.5 rounded-full bg-slate-950" />
+        </div>
+      );
+    }
+
+    return (
+      <div
+        className={`w-11 h-9 rounded-xl ${eyeColor} flex items-center justify-center`}
+      >
+        <div className="w-3.5 h-3.5 rounded-full bg-slate-950 flex items-start justify-start p-0.5">
+          <div className="w-1 h-1 rounded-full bg-white" />
+        </div>
+      </div>
+    );
+  };
 
   return (
     <div className="min-h-screen bg-[#050811] text-slate-100 font-sans p-4 md:p-6">
@@ -1546,7 +1693,9 @@ export default function OmniBotMissionControl() {
         {/* HEADER */}
         <header
           className={`bg-slate-900/95 border rounded-2xl px-5 py-3.5 flex flex-wrap items-center justify-between gap-4 shadow-xl transition-colors ${
-            isAngryMode ? "border-rose-500/70 shadow-rose-950/40" : "border-slate-800"
+            isAngryMode
+              ? "border-rose-500/80 shadow-rose-950/50"
+              : "border-slate-800"
           }`}
         >
           <div className="flex items-center gap-3.5">
@@ -1567,8 +1716,8 @@ export default function OmniBotMissionControl() {
                 {wsConnected ? "ESP32:ONLINE" : "ESP32:OFFLINE"}
               </span>
               {isAngryMode && (
-                <span className="text-[11px] font-mono font-extrabold px-2.5 py-0.5 rounded-md bg-rose-500 text-white shadow-[0_0_12px_#f43f5e]">
-                  🔴 ANGRY OVERDRIVE: RED RING & EYES
+                <span className="text-[11px] font-mono font-extrabold px-2.5 py-0.5 rounded-md bg-rose-600 text-white shadow-[0_0_14px_#f43f5e]">
+                  🔴 ANGRY MODE: RED EYES & RING
                 </span>
               )}
             </div>
@@ -1655,7 +1804,7 @@ export default function OmniBotMissionControl() {
 
               <div>
                 <label className="text-slate-400 block mb-1 font-bold uppercase">
-                  Collar Mic Device:
+                  Microphone (MacBook or Collar Mic):
                 </label>
                 <select
                   value={selectedMicId}
@@ -1750,7 +1899,7 @@ export default function OmniBotMissionControl() {
 
         {/* MAIN WORKSPACE */}
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-5">
-          {/* LEFT COLUMN: CAMERA HUD + CONTROLS */}
+          {/* LEFT COLUMN: CAMERA HUD + DIGITAL EYE SIMULATOR & CONTROLS */}
           <div className="lg:col-span-6 flex flex-col gap-4">
             <div className="bg-slate-900/90 border border-slate-800 rounded-2xl p-4 shadow-xl">
               <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
@@ -1759,11 +1908,6 @@ export default function OmniBotMissionControl() {
                     OPTICAL FEED ({facesDetected} FACE
                     {facesDetected === 1 ? "" : "S"})
                   </span>
-                  {facesDetected >= 5 && (
-                    <span className="text-[10px] font-mono font-bold px-2 py-0.5 rounded bg-rose-500/20 text-rose-300 border border-rose-500/40 animate-pulse">
-                      ⚠️ CROWD OVERLOAD (&gt;4)
-                    </span>
-                  )}
                 </div>
                 <div className="flex items-center gap-3 text-xs font-medium text-slate-300">
                   <label className="flex items-center gap-1.5 cursor-pointer">
@@ -1854,12 +1998,32 @@ export default function OmniBotMissionControl() {
               </div>
             </div>
 
-            {/* SERVO OVERRIDE, RED/CYAN RING VU & DIGITAL EYE SIMULATOR */}
+            {/* LIVE DUAL-EYE SIMULATOR (TURNS RED ON ANGRY) + SERVO & RING */}
             <div
               className={`bg-slate-900/90 border rounded-2xl p-4 space-y-4 shadow-xl transition-colors ${
-                isAngryMode ? "border-rose-500/60" : "border-slate-800"
+                isAngryMode ? "border-rose-500/70" : "border-slate-800"
               }`}
             >
+              {/* Digital Dual-OLED Eye Preview Box */}
+              <div className="flex items-center justify-between bg-slate-950 border border-slate-800 rounded-xl px-4 py-3">
+                <div>
+                  <span className="text-[11px] font-extrabold uppercase tracking-wider text-slate-400 block">
+                    LIVE ROBOT EYES & RING STATE
+                  </span>
+                  <span
+                    className={`text-xs font-mono font-bold uppercase ${
+                      isAngryMode ? "text-rose-400" : "text-sky-400"
+                    }`}
+                  >
+                    EMOTE: {currentMood.replace("_", " ")}
+                  </span>
+                </div>
+                <div className="flex items-center gap-6 px-4 py-1">
+                  {renderDigitalEye(true)}
+                  {renderDigitalEye(false)}
+                </div>
+              </div>
+
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                 <div>
                   <div className="flex justify-between text-xs font-bold text-slate-300 mb-1">
@@ -1942,35 +2106,17 @@ export default function OmniBotMissionControl() {
                 </div>
               </div>
 
-              {/* Dual Eye Expression Pills + Live Red Angry Eye Indicator */}
+              {/* 11-Emote Matrix */}
               <div>
-                <div className="flex items-center justify-between mb-2">
-                  <span className="text-xs font-bold text-slate-300">
-                    DUAL EYE EXPRESSIONS:
-                  </span>
-                  <div className="flex items-center gap-2">
-                    <span
-                      className={`inline-block w-3 h-2 rounded-xs ${
-                        isAngryMode
-                          ? "bg-rose-500 shadow-[0_0_10px_#f43f5e] -rotate-12"
-                          : "bg-sky-400"
-                      }`}
-                    />
-                    <span
-                      className={`inline-block w-3 h-2 rounded-xs ${
-                        isAngryMode
-                          ? "bg-rose-500 shadow-[0_0_10px_#f43f5e] rotate-12"
-                          : "bg-sky-400"
-                      }`}
-                    />
-                  </div>
-                </div>
+                <span className="text-xs font-bold text-slate-300 block mb-2">
+                  11 EXPRESSIVE EMOTES (INSTANT HARDWARE TRIGGER):
+                </span>
                 <div className="flex flex-wrap gap-1.5">
                   {moods.map((m) => (
                     <button
                       key={m}
                       onClick={() => updateTelemetry({ mood: m }, true)}
-                      className={`px-3 py-1.5 rounded-lg text-xs font-bold uppercase border transition ${
+                      className={`px-2.5 py-1.5 rounded-lg text-xs font-bold uppercase border transition ${
                         currentMood === m
                           ? m === "angry"
                             ? "bg-rose-600 text-white border-rose-400 shadow-[0_0_12px_#f43f5e]"
@@ -1978,6 +2124,11 @@ export default function OmniBotMissionControl() {
                           : "bg-slate-950 border-slate-800 text-slate-400 hover:text-slate-200"
                       }`}
                     >
+                      {m === "crying" && "😭 "}
+                      {m === "scared" && "😨 "}
+                      {m === "love" && "😍 "}
+                      {m === "dizzy" && "😵‍💫 "}
+                      {m === "angry" && "😡 "}
                       {m.replace("_", " ")}
                     </button>
                   ))}
@@ -1986,21 +2137,17 @@ export default function OmniBotMissionControl() {
             </div>
           </div>
 
-          {/* RIGHT COLUMN: VOICE + CHAT & MATH EQUATION STREAM */}
+          {/* RIGHT COLUMN: GROQ WHISPER MIC + CHAT & MATH EQUATION STREAM */}
           <div className="lg:col-span-6 flex flex-col bg-slate-900/90 border border-slate-800 rounded-2xl p-4 shadow-xl justify-between gap-4">
             <div className="space-y-3">
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <div className="flex items-center gap-2">
                   <span className="text-xs font-extrabold uppercase tracking-wider text-slate-300">
-                    VOICE & EQUATION STREAM
+                    GROQ WHISPER VOICE & EQUATION STREAM
                   </span>
                   <span className="text-[11px] font-mono px-2 py-0.5 rounded bg-slate-950 border border-slate-800 text-sky-300">
-                    {activeIntentBadge === "guest_intro"
-                      ? "🤝 GUEST INTRO PIVOT"
-                      : activeIntentBadge === "math_solve"
+                    {activeIntentBadge === "math_solve"
                       ? "📐 STEP-BY-STEP MATH"
-                      : activeIntentBadge === "object_inspect"
-                      ? "✋ OBJECT ID"
                       : "🧠 5-TURN MEMORY"}
                   </span>
                 </div>
@@ -2014,7 +2161,7 @@ export default function OmniBotMissionControl() {
                         : "text-slate-400"
                     }`}
                   >
-                    EN-IN
+                    EN + Hinglish
                   </button>
                   <button
                     onClick={() => setMicLang("hi-IN")}
@@ -2024,37 +2171,44 @@ export default function OmniBotMissionControl() {
                         : "text-slate-400"
                     }`}
                   >
-                    HI-IN
+                    Pure Hindi
                   </button>
                 </div>
               </div>
 
+              {/* Hardware VAD + Groq Whisper Mic Button */}
               <div className="space-y-1.5">
                 <button
                   onClick={toggleMicButton}
                   disabled={isThinking}
                   className={`w-full py-3.5 px-4 rounded-xl font-extrabold text-sm border transition flex items-center justify-center gap-2.5 shadow-lg ${
-                    micActive
+                    isRecordingSpeech
+                      ? "bg-rose-500/30 border-rose-400 text-rose-200 animate-pulse"
+                      : micActive
                       ? "bg-emerald-500/20 border-emerald-400 text-emerald-200"
-                      : isSpeaking
-                      ? "bg-sky-500/20 border-sky-400 text-sky-200"
                       : "bg-sky-400 hover:bg-sky-300 text-slate-950 border-transparent"
                   }`}
                 >
-                  {micActive
-                    ? "🎙️ CONTINUOUS MIC LOCKED ON (SPEAK ANYTIME — CLICK TO PAUSE)"
-                    : "🎙️ ACTIVATE CONTINUOUS COLLAR MIC"}
+                  {isRecordingSpeech
+                    ? "🎙️ HEARING YOU SPEAK... (PAUSE 1s TO SEND)"
+                    : micActive
+                    ? "🎙️ ALWAYS-ON MIC ACTIVE (MACBOOK OR COLLAR MIC — CLICK TO PAUSE)"
+                    : "🎙️ START ALWAYS-ON MIC (GROQ WHISPER VAD)"}
                 </button>
 
-                <div className="flex items-center justify-between px-1 text-[11px] font-mono">
-                  <span className="text-slate-400 truncate">
-                    {liveHeardWords
-                      ? `Hearing: "${liveHeardWords}"`
-                      : micStatusHint}
+                {/* Live Hardware Audio Level Bar */}
+                <div className="flex items-center gap-2.5 px-1">
+                  <div className="w-32 h-2 bg-slate-950 rounded-full overflow-hidden border border-slate-800">
+                    <div
+                      className={`h-full transition-all duration-75 ${
+                        micVolumeLevel >= 18 ? "bg-emerald-400" : "bg-sky-500/50"
+                      }`}
+                      style={{ width: `${micVolumeLevel}%` }}
+                    />
+                  </div>
+                  <span className="text-[11px] font-mono text-slate-400 truncate">
+                    {micStatusHint}
                   </span>
-                  {micActive && (
-                    <span className="text-emerald-400 font-bold">● LIVE</span>
-                  )}
                 </div>
               </div>
 
@@ -2073,8 +2227,8 @@ export default function OmniBotMissionControl() {
                     text: "__CROWD_ALERT__",
                   },
                   {
-                    label: "🤝 Introduce Teacher",
-                    text: "Hey Omni, meet my class 10 teacher standing here with me!",
+                    label: "😭 Pretend to Cry",
+                    text: "Omni, the judges said they might cut your marks, show us how sad you are!",
                   },
                 ].map((item) => (
                   <button
@@ -2112,8 +2266,6 @@ export default function OmniBotMissionControl() {
                       }`}
                     >
                       {log.sender}
-                      {log.intent === "guest_intro" &&
-                        " • [🤝 GUEST INTRO PIVOT]"}
                       {log.mood ? ` • [${log.mood.toUpperCase()}]` : ""}
                       {log.latencyMs ? ` • ${log.latencyMs}ms` : ""}
                     </span>
@@ -2121,7 +2273,6 @@ export default function OmniBotMissionControl() {
                   </div>
                   <p className="text-[13px]">{log.text}</p>
 
-                  {/* FORMATTED STEP-BY-STEP MATHEMATICAL EQUATION BLOCK */}
                   {log.mathSteps && log.mathSteps.length > 0 && (
                     <div className="mt-2.5 p-3 rounded-lg bg-[#04070e] border border-purple-500/40 font-mono text-sm space-y-1.5 shadow-inner">
                       <div className="text-[10px] font-bold uppercase tracking-wider text-purple-400 border-b border-slate-800 pb-1 mb-1.5">
@@ -2165,7 +2316,7 @@ export default function OmniBotMissionControl() {
                 type="text"
                 value={promptInput}
                 onChange={(e) => setPromptInput(e.target.value)}
-                placeholder="Speak into mic or type a math problem / question..."
+                placeholder="Speak into your MacBook mic or type a question..."
                 className="flex-1 bg-slate-950 border border-slate-800 rounded-xl px-3.5 py-2.5 text-xs text-white focus:outline-none focus:border-sky-400"
               />
               <button

@@ -8,7 +8,11 @@ export type EyeMood =
   | "wink_left"
   | "wink_right"
   | "angry"
-  | "surprised";
+  | "surprised"
+  | "crying"
+  | "scared"
+  | "love"
+  | "dizzy";
 
 export type TaskIntent =
   | "chat"
@@ -62,12 +66,16 @@ STRICT PERSONALITY & ADDRESSING RULES:
    - Only address Aamir or his teammates (${teamRosterStr}) by name when they are visually recognized in frame OR when someone brings them up / asks about the team in conversation.
 3. SPECIAL CASE — THE "MARUTI OMNI VAN / CAR" TEASE:
    - If the user compares you to the "Maruti Omni" car/van, calls you an Omni van, ambulance, or makes a kidnapping van joke:
-   - Deliver a savage, hilarious roast back! (e.g., remind them that Maruti Omni is a tin box from the 90s used in Bollywood kidnapping scenes, whereas you have a neural AI brain—though if they keep teasing you, you might still call a Maruti Omni van to pack them up, or point out that even a 1998 Omni van has more horsepower than their sense of humor).
-4. MULTILINGUAL VOICE SUPPORT (ENGLISH & NATURAL HINDI):
+   - Use [MOOD:angry] or [MOOD:suspicious] and deliver a savage, hilarious roast back!
+4. EXPRESSIVE 11-MOOD EMOTE SYSTEM:
+   - Start EVERY response with your chosen mood tag in brackets:
+     [MOOD:normal] [MOOD:happy] [MOOD:suspicious] [MOOD:wink_left] [MOOD:wink_right] [MOOD:angry] [MOOD:surprised] [MOOD:crying] [MOOD:scared] [MOOD:love] [MOOD:dizzy]
+   - Use [MOOD:crying] when being dramatically sad/emotional, [MOOD:scared] when pretending to be terrified of strict teachers/exams, [MOOD:love] when someone compliments you, and [MOOD:dizzy] when confused or overwhelmed!
+5. MULTILINGUAL VOICE SUPPORT (ENGLISH & NATURAL HINDI):
    - Detect whether the user is speaking English or Hindi/Hinglish.
    - If the user speaks English -> Start your output with [MOOD:happy][LANG:en] followed by natural English.
    - If the user speaks Hindi or Hinglish -> Start your output with [MOOD:happy][LANG:hi] followed by natural, everyday conversational Indian Hindi/Hinglish (written in Devanagari script like "अरे भाई, मारुति ओमनी वैन से कंपेयर मत करो यार, मेरा दिमाग उससे सौ गुना तेज चलता है!").
-5. LENGTH:
+6. LENGTH:
    - Keep spoken replies to 1 to 2 short, punchy sentences MAX. No markdown, no asterisks.`;
 
   if (intent === "guest_intro") {
@@ -83,7 +91,7 @@ Your neck motor has just looked at the speaker and is now turning to face the gu
     return `${coreIdentity}
 CURRENT TASK (LIVE CAMERA OBSERVATION - NO HALLUCINATIONS):
 Look at the attached live webcam photo (${facesCount} faces detected, Recognized Team in Frame: ${visibleTeamStr}).
-Comment ONLY on what is literally visible in front of your camera right now in 1 short sentence (e.g., what someone is wearing, their expression, or greet a recognized teammate by name if they just stepped into frame). If nobody is there, let out a quiet [sigh] and comment on the quiet booth.`;
+Comment ONLY on what is literally visible in front of your camera right now in 1 short sentence.`;
   }
 
   if (intent === "math_solve") {
@@ -142,6 +150,10 @@ function parseTagsAndReply(raw: string): {
     "wink_right",
     "angry",
     "surprised",
+    "crying",
+    "scared",
+    "love",
+    "dizzy",
   ];
 
   let mood: EyeMood = "happy";
@@ -161,7 +173,6 @@ function parseTagsAndReply(raw: string): {
     lang = "hi";
   }
 
-  // Extract [EQUATION: step1 | step2 | step3]
   const eqMatch = cleaned.match(/\[EQUATION:\s*([\s\S]*?)\]/i);
   if (eqMatch && eqMatch[1]) {
     mathSteps = eqMatch[1]
