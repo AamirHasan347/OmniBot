@@ -1,0 +1,6 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "buildCommand": "cd omni-bot-control && npm install && npm run build",
+  "outputDirectory": "omni-bot-control/.next",
+  "installCommand": "cd omni-bot-control && npm install"
+}

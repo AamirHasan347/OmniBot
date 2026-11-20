@@ -221,7 +221,7 @@ export default function OmniBotMissionControl() {
   // 1. CONNECTION, TELEMETRY & TEAM ROSTER STATE
   // ---------------------------------------------------------------------------
   const [wsUrl, setWsUrl] = useState<string>(
-    process.env.NEXT_PUBLIC_ESP32_WS_URL || "ws://192.168.10.44:81",
+    process.env.NEXT_PUBLIC_ESP32_WS_URL || "ws://10.19.124.235",
   );
   const [chatterboxUrl, setChatterboxUrl] = useState<string>(
     "http://127.0.0.1:4123/tts",
@@ -945,7 +945,7 @@ export default function OmniBotMissionControl() {
     async function loadMediaPipe() {
       try {
         const vision = await FilesetResolver.forVisionTasks(
-          "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm",
+          "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.21/wasm"
         );
         const detector = await FaceDetector.createFromOptions(vision, {
           baseOptions: {
