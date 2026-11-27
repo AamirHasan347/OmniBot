@@ -347,7 +347,7 @@ export async function POST(req: NextRequest) {
     debug.push(`candidates=[${candidateModels.join(", ")}]`);
 
     // Trimmed history: last 3 turns only — saves ~800 tokens per request
-    const recentHistory = history.slice(-3).map((turn) => ({
+    const recentHistory = history.slice(-2).map((turn) => ({
       role: turn.role,
       content: turn.content,
     }));
@@ -400,7 +400,7 @@ export async function POST(req: NextRequest) {
                 model: modelId,
                 messages: messagesPayload,
                 temperature: intent === "math_solve" ? 0.2 : 0.78,
-                max_completion_tokens: 250,
+                max_completion_tokens: 150,
               }),
             },
             12000,
@@ -445,16 +445,15 @@ export async function POST(req: NextRequest) {
               .replace(/\s+/g, " ")}`,
           );
 
-          if (groqRes.status === 429) {
+                   if (groqRes.status === 429) {
             const isDaily = /tokens per day|TPD/i.test(errBody);
-            markKeyExhausted(
-              key,
-              isDaily ? msUntilNextUtcMidnight() : 60_000,
-            );
+            // Cap daily cache to 30 minutes so you recover faster
+            const cooldownMs = isDaily 
+              ? Math.min(msUntilNextUtcMidnight(), 30 * 60 * 1000) 
+              : 60_000;
+            markKeyExhausted(key, cooldownMs);
             debug.push(
-              `  ↳ ${keyLabel} marked ${
-                isDaily ? "exhausted until UTC midnight" : "exhausted for 60s"
-              }`,
+              `  ↳ ${keyLabel} marked exhausted for ${Math.round(cooldownMs / 60000)} minutes`
             );
           }
         } catch (loopErr: any) {
@@ -495,7 +494,7 @@ export async function POST(req: NextRequest) {
               ],
               generationConfig: {
                 temperature: intent === "math_solve" ? 0.2 : 0.78,
-                maxOutputTokens: 250,
+                maxOutputTokens: 1500,
               },
             }),
           },
@@ -537,14 +536,34 @@ export async function POST(req: NextRequest) {
       debug.push("⚠ needsVision=true but GEMINI_API_KEY missing in .env.local");
     }
 
-    // ── 3. ROTATING OFFLINE FALLBACK ────────────────────────────────
-    debug.push("⛔ ALL MODELS × ALL KEYS FAILED — rotating fallback");
+        // ── 3. ROTATING OFFLINE FALLBACK ────────────────────────────────
+    // Figure out the actual reason from the debug log
+    const anyQuotaHit = debug.some(d => d.includes("429"));
+    const anyTimeout = debug.some(d => d.includes("EXCEPTION") && d.includes("Abort"));
+    const anyKeyMissing = debug.some(d => d.includes("NO GROQ KEYS"));
+    
+    let failureReason = "unknown";
+    let replyText = pickOfflineResponse(intent);
+    
+    if (anyKeyMissing) {
+      failureReason = "no_api_keys";
+      replyText = "My API keys are missing — check .env.local!";
+    } else if (anyQuotaHit) {
+      failureReason = "daily_quota_exhausted";
+      replyText = "My brain quota is maxed out for today — try again after midnight or plug in a fresh Groq key!";
+    } else if (anyTimeout) {
+      failureReason = "network_timeout";
+      replyText = "My internet hiccupped — say that again?";
+    }
+    
+    debug.push(`⛔ FALLBACK: ${failureReason}`);
     return NextResponse.json({
-      reply: pickOfflineResponse(intent),
+      reply: replyText,
       mood: "suspicious",
       lang: "en",
       mathSteps: [],
       source: "offline_fallback",
+      failureReason,  // <-- frontend can read this
       debug,
     });
   } catch (error: any) {

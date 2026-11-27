@@ -1,73 +1,108 @@
-// src/app/api/stt/route.ts
 import { NextRequest, NextResponse } from "next/server";
+
+// Same cache pattern as omni-brain so a dead key never blocks STT twice
+const exhaustedKeys = new Map<string, number>();
+
+function isKeyExhausted(key: string): boolean {
+  const until = exhaustedKeys.get(key);
+  if (!until) return false;
+  if (Date.now() > until) {
+    exhaustedKeys.delete(key);
+    return false;
+  }
+  return true;
+}
+
+// Helper to prevent hanging requests
+async function fetchWithTimeout(url: string, options: RequestInit, timeoutMs = 6000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 export async function POST(req: NextRequest) {
   try {
     const formData = await req.formData();
-    const audioFile = formData.get("file") as Blob | null;
-    const lang = (formData.get("lang") as string) || "en";
+    const file = formData.get("file") as File | null;
+    const lang = String(formData.get("lang") || "en");
 
-    if (!audioFile) {
-      return NextResponse.json({ error: "No audio file" }, { status: 400 });
-    }
-
-    const groqKey = (process.env.GROQ_API_KEY || "").trim();
-    if (!groqKey) {
+    if (!file || file.size < 900) {
       return NextResponse.json(
-        { error: "Missing GROQ_API_KEY in .env.local" },
-        { status: 500 }
+        { text: "", error: "empty_audio" },
+        { status: 200 },
       );
     }
 
-    const upstreamForm = new FormData();
-    upstreamForm.append("file", audioFile, "speech.webm");
-    upstreamForm.append("model", "whisper-large-v3-turbo");
-    upstreamForm.append("temperature", "0");
-    upstreamForm.append("response_format", "json");
-    if (lang === "hi-IN") {
-      upstreamForm.append("language", "hi");
+    const keyPool: string[] = [];
+    for (const k of [
+      process.env.GROQ_API_KEY_1,
+      process.env.GROQ_API_KEY_2,
+      process.env.GROQ_API_KEY_3,
+      process.env.GROQ_API_KEY,
+    ]) {
+      const t = (k || "").trim();
+      if (t && !keyPool.includes(t)) keyPool.push(t);
     }
 
-    const res = await fetch(
-      "https://api.groq.com/openai/v1/audio/transcriptions",
-      {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${groqKey}`,
-        },
-        body: upstreamForm,
+    if (keyPool.length === 0) {
+      console.warn("[STT] No Groq API keys found in .env.local");
+      return NextResponse.json(
+        { text: "", error: "no_groq_key" },
+        { status: 200 },
+      );
+    }
+
+    let lastError = "";
+
+    for (const apiKey of keyPool) {
+      if (isKeyExhausted(apiKey)) continue;
+
+      try {
+        const groqForm = new FormData();
+        groqForm.append("file", file, file.name || "speech.webm");
+        groqForm.append("model", "whisper-large-v3-turbo");
+        if (lang.startsWith("hi")) groqForm.append("language", "hi");
+
+        const res = await fetchWithTimeout(
+          "https://api.groq.com/openai/v1/audio/transcriptions",
+          {
+            method: "POST",
+            headers: { Authorization: `Bearer ${apiKey}` },
+            body: groqForm,
+          },
+          6000 // 6 second timeout per key
+        );
+
+        if (res.ok) {
+          const data = await res.json();
+          return NextResponse.json(
+            { text: data?.text || "" },
+            { status: 200 },
+          );
+        }
+
+        lastError = `HTTP ${res.status}`;
+        if (res.status === 429) exhaustedKeys.set(apiKey, Date.now() + 60_000);
+        console.warn(`[STT] Groq ${res.status}:`, lastError);
+      } catch (e: any) {
+        lastError = e?.name === 'AbortError' ? 'Timeout' : (e?.message || "network_error");
+        console.warn("[STT] key attempt failed:", lastError);
       }
+    }
+
+    return NextResponse.json(
+      { text: "", error: `stt_failed: ${lastError}` },
+      { status: 200 },
     );
-
-    if (!res.ok) {
-      const errText = await res.text();
-      console.warn("[STT] Groq Whisper error:", errText);
-      return NextResponse.json({ text: "" }, { status: 200 });
-    }
-
-    const data = await res.json();
-    const rawText = (data.text || "").trim();
-
-    // Filter out common Whisper silence hallucinations ("Thank you.", "You", ".")
-    const hallucinations = [
-      "thank you.",
-      "thank you",
-      "thanks for watching.",
-      "you",
-      ".",
-      "bye.",
-      "subtitles by",
-    ];
-    if (
-      rawText.length < 2 ||
-      hallucinations.includes(rawText.toLowerCase())
-    ) {
-      return NextResponse.json({ text: "" });
-    }
-
-    return NextResponse.json({ text: rawText });
   } catch (err: any) {
-    console.error("[STT] Exception:", err?.message || err);
-    return NextResponse.json({ text: "" }, { status: 200 });
+    console.error("[STT] outer error:", err);
+    return NextResponse.json(
+      { text: "", error: "stt_exception" },
+      { status: 200 },
+    );
   }
 }

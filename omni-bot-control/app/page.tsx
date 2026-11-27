@@ -227,6 +227,15 @@ export default function OmniBotMissionControl() {
     "http://127.0.0.1:4123/tts",
   );
   const [wsConnected, setWsConnected] = useState<boolean>(false);
+  // Add near wsConnected state:
+  const [usbConnected, setUsbConnected] = useState<boolean>(false);
+
+  // Add near wsRef:
+  const serialPortRef = useRef<any>(null);
+  const serialWriterRef =
+    useRef<WritableStreamDefaultWriter<Uint8Array> | null>(null);
+  const textEncoderRef = useRef<TextEncoder>(new TextEncoder());
+  const usbConnectedRef = useRef<boolean>(false);
   const [ttsEngineStatus, setTtsEngineStatus] =
     useState<string>("Neural TTS (4123)");
   const [showDebugDrawer, setShowDebugDrawer] = useState<boolean>(false);
@@ -252,8 +261,7 @@ export default function OmniBotMissionControl() {
   const [passiveLifeHabits, setPassiveLifeHabits] = useState<boolean>(true);
   const [crowdControlEnabled, setCrowdControlEnabled] = useState<boolean>(true);
   // Enabled by default! Every 28s of silence, Omni-Bot comments on the live camera feed:
-  const [spontaneousMonologue, setSpontaneousMonologue] =
-    useState<boolean>(true);
+  const [spontaneousMonologue, setSpontaneousMonologue] = useState<boolean>(false);
   const [invertPanDirection, setInvertPanDirection] = useState<boolean>(false);
   const [offlineMode, setOfflineMode] = useState<boolean>(false);
 
@@ -275,6 +283,13 @@ export default function OmniBotMissionControl() {
 
   const [micActive, setMicActive] = useState<boolean>(false);
   const [micVolumeLevel, setMicVolumeLevel] = useState<number>(0);
+  const [liveTranscript, setLiveTranscript] = useState<string>("");
+  const [noiseThreshold, setNoiseThreshold] = useState<number>(45); // was 28
+  const noiseThresholdRef = useRef<number>(45);
+
+  useEffect(() => {
+    noiseThresholdRef.current = noiseThreshold;
+  }, [noiseThreshold]);
   const [isRecordingSpeech, setIsRecordingSpeech] = useState<boolean>(false);
   const [micStatusHint, setMicStatusHint] = useState<string>(
     "Click 'Start Always-On Mic' — Works with Built-in MacBook Mic or Wired Mic!",
@@ -314,6 +329,10 @@ export default function OmniBotMissionControl() {
   const trackedFacesRef = useRef<TrackedFace[]>([]);
   const chatLogsRef = useRef<ChatLog[]>([]);
 
+  // Dispatch de-dupe: prevents double-firing when both Browser SR and
+  // Whisper transcribe the same utterance within a few seconds.
+  const lastDispatchRef = useRef<Array<{ text: string; ts: number }>>([]);
+
   const telemetryRef = useRef<{ pan: number; mood: EyeMood; volume: number }>({
     pan: 90,
     mood: "normal",
@@ -345,7 +364,11 @@ export default function OmniBotMissionControl() {
   const micAudioCtxRef = useRef<AudioContext | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
+  const ambientNoiseFloorRef = useRef<number>(10);
   const vadAnimFrameRef = useRef<number | null>(null);
+  const recognitionRef = useRef<any>(null);
+  const speechCommitTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const pendingTranscriptRef = useRef<string>("");
 
   useEffect(() => {
     chatLogsRef.current = chatLogs;
@@ -605,25 +628,189 @@ export default function OmniBotMissionControl() {
   // 6. ZERO-LAG DELTA WEBSOCKET DISPATCHER
   // ---------------------------------------------------------------------------
   const sendNowIfChanged = useCallback((force = false) => {
+    const curr = telemetryRef.current;
+    const prev = lastSentRef.current;
+
+    const panChanged = Math.abs(curr.pan - prev.pan) >= 2;
+    const moodChanged = curr.mood !== prev.mood;
+    const volChanged = curr.volume !== prev.volume;
+
+    if (!force && !panChanged && !moodChanged && !volChanged) return;
+
+    const payloadStr = JSON.stringify(curr);
+
+    // PRIORITY 1: Direct USB Cable (raw Uint8Array — never locks with pipeTo)
+    if (usbConnectedRef.current && serialWriterRef.current) {
+      const bytes = textEncoderRef.current.encode(payloadStr + "\n");
+      serialWriterRef.current.write(bytes).catch((err) => {
+        console.warn("USB write failed:", err);
+        usbConnectedRef.current = false;
+        setUsbConnected(false);
+      });
+      lastSentRef.current = { ...curr };
+      setLastWsPayload(payloadStr);
+      setWsPacketsSent((c) => c + 1);
+      return;
+    }
+
+    // PRIORITY 2: Wi-Fi WebSocket Backup
     const ws = wsRef.current;
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
     if (ws.bufferedAmount > 128 && !force) return;
 
-    const curr = telemetryRef.current;
-    const prev = lastSentRef.current;
-
-    const panChanged = Math.abs(curr.pan - prev.pan) >= 1;
-    const moodChanged = curr.mood !== prev.mood;
-    const volChanged = curr.volume !== prev.volume;
-
-    if (force || panChanged || moodChanged || volChanged) {
-      const payloadStr = JSON.stringify(curr);
-      ws.send(payloadStr);
-      lastSentRef.current = { ...curr };
-      setLastWsPayload(payloadStr);
-      setWsPacketsSent((c) => c + 1);
-    }
+    ws.send(payloadStr);
+    lastSentRef.current = { ...curr };
+    setLastWsPayload(payloadStr);
+    setWsPacketsSent((c) => c + 1);
   }, []);
+
+  const attachPortSafely = useCallback(
+    async (port: any) => {
+      // Only open if not already open (prevents InvalidStateError)
+      if (!port.writable) {
+        await port.open({ baudRate: 115200 });
+      }
+
+      // Release DTR/RTS so Chrome doesn't hold ESP32 in reset
+      try {
+        await port.setSignals({
+          dataTerminalReady: false,
+          requestToSend: false,
+        });
+      } catch {}
+
+      if (port.writable.locked) {
+        return;
+      }
+
+      const writer = port.writable.getWriter();
+      serialPortRef.current = port;
+      serialWriterRef.current = writer;
+      usbConnectedRef.current = true;
+      setUsbConnected(true);
+
+      port.addEventListener("disconnect", () => {
+        usbConnectedRef.current = false;
+        setUsbConnected(false);
+        serialWriterRef.current = null;
+        serialPortRef.current = null;
+      });
+
+      setTimeout(() => sendNowIfChanged(true), 200);
+    },
+    [sendNowIfChanged],
+  );
+  //keep this one
+  const connectUsbSerial = useCallback(async () => {
+    if (typeof navigator === "undefined" || !("serial" in navigator)) {
+      alert("Web Serial requires Google Chrome on desktop!");
+      return;
+    }
+    try {
+      if (serialWriterRef.current) {
+        try {
+          serialWriterRef.current.releaseLock();
+        } catch {}
+        serialWriterRef.current = null;
+      }
+      if (serialPortRef.current) {
+        try {
+          await serialPortRef.current.close();
+        } catch {}
+        serialPortRef.current = null;
+      }
+
+      const port = await (navigator as any).serial.requestPort();
+      await attachPortSafely(port);
+    } catch (err: any) {
+      // Ignore harmless cancel clicks
+      if (err?.name !== "NotFoundError") {
+        console.warn("USB Serial connect failed:", err);
+      }
+    }
+  }, [attachPortSafely]);
+
+  // Auto-reconnect on load & cleanly release lock on refresh
+  useEffect(() => {
+    if (typeof navigator === "undefined" || !("serial" in navigator)) return;
+
+    let cancelled = false;
+    async function autoAttachUsb() {
+      try {
+        const ports = await (navigator as any).serial.getPorts();
+        if (
+          cancelled ||
+          !ports ||
+          ports.length === 0 ||
+          usbConnectedRef.current
+        )
+          return;
+        await attachPortSafely(ports[0]);
+      } catch {
+        // Port busy or not plugged in yet; user can click Connect USB button
+      }
+    }
+
+    autoAttachUsb();
+
+    const releasePort = () => {
+      usbConnectedRef.current = false;
+      const writer = serialWriterRef.current;
+      const port = serialPortRef.current;
+      serialWriterRef.current = null;
+      serialPortRef.current = null;
+
+      try {
+        writer?.releaseLock();
+      } catch {}
+      port?.close?.().catch(() => {});
+    };
+
+    window.addEventListener("beforeunload", releasePort);
+    return () => {
+      cancelled = true;
+      window.removeEventListener("beforeunload", releasePort);
+      releasePort();
+    };
+  }, [attachPortSafely]);
+
+  // Auto-reconnect to the previously approved ESP32 USB port on page load
+  useEffect(() => {
+    if (typeof navigator === "undefined" || !("serial" in navigator)) return;
+
+    let cancelled = false;
+    async function autoAttachUsb() {
+      try {
+        const ports = await (navigator as any).serial.getPorts();
+        if (
+          cancelled ||
+          !ports ||
+          ports.length === 0 ||
+          usbConnectedRef.current
+        )
+          return;
+        await attachPortSafely(ports[0]);
+      } catch {
+        // Port busy or not plugged in yet; user can click Connect USB button
+      }
+    }
+
+    autoAttachUsb();
+
+    // Release the USB port cleanly before refresh/hot-reload so Chrome doesn't lock it
+    const releasePort = () => {
+      try {
+        serialWriterRef.current?.releaseLock();
+        serialPortRef.current?.close();
+      } catch {}
+    };
+    window.addEventListener("beforeunload", releasePort);
+    return () => {
+      cancelled = true;
+      window.removeEventListener("beforeunload", releasePort);
+      releasePort();
+    };
+  }, [sendNowIfChanged]);
 
   const updateTelemetry = useCallback(
     (
@@ -945,7 +1132,7 @@ export default function OmniBotMissionControl() {
     async function loadMediaPipe() {
       try {
         const vision = await FilesetResolver.forVisionTasks(
-          "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.21/wasm"
+          "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.21/wasm",
         );
         const detector = await FaceDetector.createFromOptions(vision, {
           baseOptions: {
@@ -1162,15 +1349,15 @@ export default function OmniBotMissionControl() {
       if (!video || video.readyState < 2) return null;
 
       const offscreen = document.createElement("canvas");
-      const targetW = 480;
-      const targetH = 360;
+      const targetW = 256;
+      const targetH = 192;
       offscreen.width = targetW;
       offscreen.height = targetH;
 
       const ctx = offscreen.getContext("2d");
       if (!ctx) return null;
       ctx.drawImage(video, 0, 0, targetW, targetH);
-      return offscreen.toDataURL("image/jpeg", 0.6);
+      return offscreen.toDataURL("image/jpeg", 0.25);
     },
     [],
   );
@@ -1344,16 +1531,54 @@ export default function OmniBotMissionControl() {
     ],
   );
 
+  // ─────────────────────────────────────────────────────────────
+  // Voice dispatch de-dupe: prevents Browser SR and Whisper from
+  // double-firing the same utterance. MUST be declared AFTER
+  // triggerOmniBrain to avoid a TDZ ReferenceError.
+  // ─────────────────────────────────────────────────────────────
+  const tryDispatchVoice = useCallback(
+    (raw: string, source: string) => {
+      const clean = raw.trim();
+      if (clean.length < 2) return;
+
+      const now = Date.now();
+      lastDispatchRef.current = lastDispatchRef.current.filter(
+        (d) => now - d.ts < 4000,
+      );
+
+      const low = clean.toLowerCase();
+      for (const d of lastDispatchRef.current) {
+        if (d.text === low || d.text.includes(low) || low.includes(d.text)) {
+          return; // already handled by the other engine
+        }
+      }
+      lastDispatchRef.current.push({ text: low, ts: now });
+
+      setLiveTranscript(clean);
+      setMicStatusHint(`🗣️ ${source}: "${clean}"`);
+      triggerOmniBrain(clean);
+    },
+    [triggerOmniBrain],
+  );
+
   // Live Camera Feed Commentary Loop (Triggers every 25s of silence when enabled)
+    // Live Camera Feed Commentary Loop (SAFE VERSION)
   useEffect(() => {
     if (!spontaneousMonologue) return;
+    let autonomousCount = 0;
+    const MAX_AUTONOMOUS_PER_SESSION = 15; // Hard cap
+
     const timer = setInterval(() => {
       if (isSpeakingRef.current || isThinkingRef.current) return;
+      if (autonomousCount >= MAX_AUTONOMOUS_PER_SESSION) return;
+      
       if (
         lastInteractionMsRef.current > 0 &&
-        Date.now() - lastInteractionMsRef.current >= 60000 &&
-  facesCountRef.current >= 1 
+        Date.now() - lastInteractionMsRef.current >= 180000 && // 3 minutes idle
+        facesCountRef.current >= 1
       ) {
+        autonomousCount++;
+        console.log(`[Autonomous] ${autonomousCount}/${MAX_AUTONOMOUS_PER_SESSION}`);
         triggerOmniBrain(
           "Look at the live webcam feed right now and make a spontaneous, witty observation about the person, crowd, or scene in front of you.",
           "autonomous_idle",
@@ -1371,7 +1596,21 @@ export default function OmniBotMissionControl() {
     setMicActive(false);
     setIsRecordingSpeech(false);
     setMicVolumeLevel(0);
+    setLiveTranscript("");
+    pendingTranscriptRef.current = "";
 
+    if (speechCommitTimerRef.current) {
+      clearTimeout(speechCommitTimerRef.current);
+      speechCommitTimerRef.current = null;
+    }
+    if (recognitionRef.current) {
+      try {
+        recognitionRef.current.onend = null;
+        recognitionRef.current.onerror = null;
+        recognitionRef.current.stop();
+      } catch {}
+      recognitionRef.current = null;
+    }
     if (vadAnimFrameRef.current) {
       cancelAnimationFrame(vadAnimFrameRef.current);
       vadAnimFrameRef.current = null;
@@ -1382,9 +1621,7 @@ export default function OmniBotMissionControl() {
     ) {
       try {
         mediaRecorderRef.current.stop();
-      } catch {
-        // Ignore
-      }
+      } catch {}
     }
     if (micStreamRef.current) {
       micStreamRef.current.getTracks().forEach((t) => t.stop());
@@ -1407,26 +1644,101 @@ export default function OmniBotMissionControl() {
               deviceId: { exact: selectedMicId },
               echoCancellation: true,
               noiseSuppression: true,
+              autoGainControl: false,
             }
-          : { echoCancellation: true, noiseSuppression: true },
+          : {
+              echoCancellation: true,
+              noiseSuppression: true,
+              autoGainControl: false,
+            },
       });
 
       micStreamRef.current = stream;
       const audioCtx = new AudioContext();
+      if (audioCtx.state === "suspended") {
+        await audioCtx.resume();
+      }
       micAudioCtxRef.current = audioCtx;
+
       const source = audioCtx.createMediaStreamSource(stream);
       const analyser = audioCtx.createAnalyser();
       analyser.fftSize = 512;
+      analyser.smoothingTimeConstant = 0.6;
       source.connect(analyser);
 
-      const dataArray = new Uint8Array(analyser.frequencyBinCount);
+      const freqData = new Uint8Array(analyser.frequencyBinCount);
+      const mimeType = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
+        ? "audio/webm;codecs=opus"
+        : MediaRecorder.isTypeSupported("audio/webm")
+          ? "audio/webm"
+          : "";
+
+      const recorder = mimeType
+        ? new MediaRecorder(stream, { mimeType })
+        : new MediaRecorder(stream);
+      mediaRecorderRef.current = recorder;
+
+      // Optional real-time captions (throttled retry on network errors)
+      const SpeechRecognitionCtor =
+        (window as any).SpeechRecognition ||
+        (window as any).webkitSpeechRecognition;
+      let speechBlockedUntil = 0;
+
+      const startLiveCaptions = () => {
+        if (!SpeechRecognitionCtor || !micActiveRef.current) return;
+        if (Date.now() < speechBlockedUntil) return;
+        try {
+          const rec = new SpeechRecognitionCtor();
+          rec.continuous = true;
+          rec.interimResults = true;
+          rec.lang = micLangRef.current || "en-IN";
+
+          rec.onresult = (event: any) => {
+            if (isSpeakingRef.current || isThinkingRef.current) return;
+
+            let interim = "";
+            let finalText = "";
+
+            for (let i = event.resultIndex; i < event.results.length; i++) {
+              const result = event.results[i];
+              const txt = result[0]?.transcript || "";
+              if (result.isFinal) finalText += txt;
+              else interim += txt;
+            }
+
+            if (interim.trim()) setLiveTranscript(interim.trim());
+
+            if (finalText.trim()) {
+              tryDispatchVoice(finalText, "WebSpeech");
+            }
+          };
+
+          rec.onerror = (e: any) => {
+            if (e?.error === "network") {
+              speechBlockedUntil = Date.now() + 4000;
+              try {
+                rec.stop();
+              } catch {}
+            }
+          };
+
+          rec.onend = () => {
+            if (micActiveRef.current && Date.now() >= speechBlockedUntil) {
+              setTimeout(() => {
+                if (micActiveRef.current) startLiveCaptions();
+              }, 120); // was 800ms
+            }
+          };
+
+          recognitionRef.current = rec;
+          rec.start();
+        } catch {}
+      };
 
       let speakingNow = false;
-      let silenceStartMs = 0;
       let speechStartMs = 0;
-
-      const recorder = new MediaRecorder(stream);
-      mediaRecorderRef.current = recorder;
+      let silenceStartMs = 0;
+      let lastMoodCueMs = 0;
 
       recorder.ondataavailable = (e) => {
         if (e.data && e.data.size > 0) {
@@ -1437,113 +1749,240 @@ export default function OmniBotMissionControl() {
       recorder.onstop = async () => {
         const chunks = audioChunksRef.current;
         audioChunksRef.current = [];
+
         if (
           chunks.length === 0 ||
+          !micActiveRef.current ||
           isSpeakingRef.current ||
           isThinkingRef.current
         ) {
+          setMicStatusHint("🟢 LIVE VOICE READY — Speak anytime!");
           return;
         }
 
-        const audioBlob = new Blob(chunks, { type: "audio/webm" });
-        if (audioBlob.size < 1800) return;
+        // Standardize to audio/webm
+        const blob = new Blob(chunks, { type: "audio/webm" });
 
-        setMicStatusHint("⚡ Transcribing voice via Groq Whisper...");
+        if (blob.size < 3000) {
+          setMicStatusHint("🟢 LIVE VOICE READY — Speak anytime!");
+          return;
+        }
+
+        setMicStatusHint("⚡ Transcribing...");
+
         try {
           const form = new FormData();
-          form.append("file", audioBlob, "speech.webm");
+          form.append("file", blob, "speech.webm");
           form.append("lang", micLangRef.current);
+
+          // Add a 10-second timeout so it doesn't hang forever
+          const controller = new AbortController();
+          const timeoutId = setTimeout(() => controller.abort(), 10000);
 
           const res = await fetch("/api/stt", {
             method: "POST",
             body: form,
+            signal: controller.signal,
           });
-          if (res.ok) {
-            const data = await res.json();
-            const text = (data.text || "").trim();
-            if (text) {
-              setMicStatusHint(`Heard: "${text}"`);
-              triggerOmniBrain(text);
-              return;
-            }
+          clearTimeout(timeoutId);
+
+          if (!res.ok) {
+            setMicStatusHint(`❌ STT Error: HTTP ${res.status}`);
+            return;
           }
-          setMicStatusHint("Listening — Speak anytime!");
-        } catch {
-          setMicStatusHint("Listening — Speak anytime!");
+
+          const data = await res.json();
+          let transcript = String(data?.text || "").trim();
+
+          if (data?.error && !transcript) {
+            setMicStatusHint(`⚠️ STT: ${data.error}`);
+            return;
+          }
+
+          // Hallucination blacklist
+          const hallucinationBlacklist = [
+            "thank you",
+            "thanks",
+            "bye",
+            "goodbye",
+            "please subscribe",
+            "subscribe",
+            "amara",
+            "you",
+            "the end",
+            "thank you.",
+            "thanks.",
+          ];
+          const lowerTranscript = transcript
+            .toLowerCase()
+            .replace(/[^\w\s]/g, "")
+            .trim();
+          const wordCount = lowerTranscript.split(/\s+/).length;
+          const allowedSingleWords = [
+            "hi",
+            "hello",
+            "stop",
+            "omni",
+            "help",
+            "yes",
+            "no",
+          ];
+          const isBadSingleWord =
+            wordCount === 1 && !allowedSingleWords.includes(lowerTranscript);
+
+          if (
+            hallucinationBlacklist.includes(lowerTranscript) ||
+            lowerTranscript.length < 3 ||
+            isBadSingleWord
+          ) {
+            console.log("Ignored hallucination/noise:", transcript);
+            setMicStatusHint("🟢 LIVE VOICE READY — Speak anytime!");
+            return;
+          }
+
+          if (transcript.length >= 2) {
+            console.log("✅ Transcribed successfully:", transcript);
+            tryDispatchVoice(transcript, "Whisper");
+          } else {
+            setMicStatusHint("🟢 LIVE VOICE READY — Speak anytime!");
+          }
+        } catch (err: any) {
+          if (err.name === "AbortError") {
+            console.warn("STT Fetch aborted due to timeout.");
+            setMicStatusHint("⚠️ STT Timeout — API took too long");
+          } else {
+            console.error("STT Fetch Error:", err);
+            setMicStatusHint("⚠️ STT Network Error");
+          }
         }
       };
 
       micActiveRef.current = true;
       setMicActive(true);
-      setMicStatusHint(
-        "Always-On Mic Active — Speak into your MacBook or Collar Mic!",
-      );
+      setLiveTranscript("");
+      setMicStatusHint("🟢 LIVE VOICE READY — Speak anytime!");
+      startLiveCaptions();
 
-      const monitorVoiceActivity = () => {
+      let smoothedLevel = 0;
+      let voiceFramesCount = 0;
+
+      const monitorVoice = () => {
         if (!micActiveRef.current || !micAudioCtxRef.current) return;
 
-        analyser.getByteFrequencyData(dataArray);
-        let sum = 0;
-        for (let i = 2; i < 45; i++) {
-          sum += dataArray[i] ?? 0;
-        }
-        const avgVolume = sum / 43;
-        const normalizedLevel = Math.min(100, Math.round(avgVolume * 1.6));
-        setMicVolumeLevel(normalizedLevel);
+        analyser.getByteFrequencyData(freqData);
 
-        // Pause recording while Omni-Bot is speaking or thinking
+        // 1. HUMAN VOICE BANDPASS FILTER
+        const startBin = 3;
+        const endBin = Math.min(36, freqData.length);
+        let sum = 0;
+        for (let i = startBin; i < endBin; i++) {
+          sum += freqData[i] ?? 0;
+        }
+        const voiceLevel = sum / (endBin - startBin);
+
+        // 2. LOWER MULTIPLIER FOR HOT COLLAR MICS (0.5 instead of 1.5)
+        // This scales the massive input down to a manageable 0-100 range.
+        const rawLevel = Math.min(100, Math.round(voiceLevel * 0.5));
+
+        // Smooth the UI bar
+        smoothedLevel = smoothedLevel * 0.4 + rawLevel * 0.6;
+        setMicVolumeLevel(Math.round(smoothedLevel));
+
+        // 3. ADAPTIVE NOISE FLOOR
+        const currentFloor = ambientNoiseFloorRef.current;
+        if (voiceLevel < currentFloor) {
+          ambientNoiseFloorRef.current =
+            currentFloor * 0.95 + voiceLevel * 0.05;
+        } else if (voiceLevel < currentFloor * 1.3) {
+          ambientNoiseFloorRef.current =
+            currentFloor * 0.98 + voiceLevel * 0.02;
+        }
+        ambientNoiseFloorRef.current = Math.max(
+          3,
+          Math.min(ambientNoiseFloorRef.current, 40),
+        );
+
+        // 4. THRESHOLDS
+        const startThreshold = Math.max(
+          noiseThresholdRef.current,
+          ambientNoiseFloorRef.current * 1.2 + 5,
+        );
+
+        const stopThreshold = speakingNow
+          ? Math.max(startThreshold - 10, 10)
+          : startThreshold;
+
         if (isSpeakingRef.current || isThinkingRef.current) {
           if (speakingNow && recorder.state === "recording") {
             audioChunksRef.current = [];
-            recorder.stop();
+            try {
+              recorder.stop();
+            } catch {}
           }
           speakingNow = false;
           setIsRecordingSpeech(false);
-          vadAnimFrameRef.current = requestAnimationFrame(monitorVoiceActivity);
+          vadAnimFrameRef.current = requestAnimationFrame(monitorVoice);
           return;
         }
 
-        const SPEECH_THRESHOLD = 18; // Sensitive enough for MacBook Air internal mic!
         const now = Date.now();
 
-        if (normalizedLevel >= SPEECH_THRESHOLD) {
+        // 5. TRIGGER LOGIC
+        if (rawLevel >= startThreshold) {
+          voiceFramesCount++;
+        } else {
+          voiceFramesCount = 0;
+        }
+
+        if (!speakingNow && voiceFramesCount >= 2) {
+          speakingNow = true;
+          speechStartMs = now;
           silenceStartMs = now;
-          if (!speakingNow) {
-            speakingNow = true;
-            speechStartMs = now;
-            setIsRecordingSpeech(true);
-            setMicStatusHint("🎙️ Hearing you speak...");
-            audioChunksRef.current = [];
-            if (recorder.state === "inactive") {
+          audioChunksRef.current = [];
+          setIsRecordingSpeech(true);
+          setMicStatusHint("🟢 LISTENING TO YOU...");
+
+          if (now - lastMoodCueMs > 2500) {
+            lastMoodCueMs = now;
+            updateTelemetry({ mood: "surprised", volume: 3 }, true);
+          }
+
+          if (recorder.state === "inactive") {
+            try {
               recorder.start();
-            }
+            } catch {}
           }
         } else if (speakingNow) {
-          // If silent for 1.05 seconds after speaking for at least 350ms -> Send to Whisper!
-          if (now - silenceStartMs >= 1050) {
+          if (rawLevel >= stopThreshold) {
+            silenceStartMs = now;
+          } else if (now - silenceStartMs >= 500) {
             speakingNow = false;
             setIsRecordingSpeech(false);
-            if (now - speechStartMs >= 350 && recorder.state === "recording") {
-              recorder.stop();
-            } else if (recorder.state === "recording") {
-              audioChunksRef.current = [];
-              recorder.stop();
+            updateTelemetry({ volume: 0 }, true);
+
+            const durationMs = now - speechStartMs;
+            if (recorder.state === "recording") {
+              if (durationMs < 200) {
+                audioChunksRef.current = [];
+              }
+              try {
+                recorder.stop();
+              } catch {}
             }
           }
         }
 
-        vadAnimFrameRef.current = requestAnimationFrame(monitorVoiceActivity);
+        vadAnimFrameRef.current = requestAnimationFrame(monitorVoice);
       };
-
-      vadAnimFrameRef.current = requestAnimationFrame(monitorVoiceActivity);
-    } catch (err: any) {
+      vadAnimFrameRef.current = requestAnimationFrame(monitorVoice);
+    } catch (err) {
       console.error("Mic start error:", err);
       setMicStatusHint(
-        "Microphone blocked! Click the camera/mic icon in Chrome's address bar to Allow.",
+        "Mic blocked — allow microphone access in Chrome's address bar.",
       );
       setMicActive(false);
     }
-  }, [selectedMicId, stopHardwareMic, triggerOmniBrain]);
+  }, [selectedMicId, stopHardwareMic, tryDispatchVoice, updateTelemetry]);
 
   const toggleMicButton = useCallback(() => {
     if (micActive) {
@@ -1552,6 +1991,50 @@ export default function OmniBotMissionControl() {
       startHardwareMic();
     }
   }, [micActive, startHardwareMic, stopHardwareMic]);
+
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.code !== "Space" || e.repeat) return;
+      const tag = (e.target as HTMLElement)?.tagName;
+      if (tag === "INPUT" || tag === "TEXTAREA") return;
+
+      e.preventDefault();
+      if (!micActiveRef.current || !mediaRecorderRef.current) return;
+      if (isSpeakingRef.current || isThinkingRef.current) return;
+
+      if (mediaRecorderRef.current.state === "inactive") {
+        audioChunksRef.current = [];
+        mediaRecorderRef.current.start();
+        setIsRecordingSpeech(true);
+        setMicStatusHint("🔴 PUSH-TO-TALK ACTIVE (RELEASE SPACE TO SEND)");
+        updateTelemetry({ mood: "surprised", volume: 4 }, true);
+      }
+    };
+
+    const handleKeyUp = (e: KeyboardEvent) => {
+      if (e.code !== "Space") return;
+      const tag = (e.target as HTMLElement)?.tagName;
+      if (tag === "INPUT" || tag === "TEXTAREA") return;
+
+      e.preventDefault();
+      if (
+        mediaRecorderRef.current &&
+        mediaRecorderRef.current.state === "recording"
+      ) {
+        mediaRecorderRef.current.stop();
+        setIsRecordingSpeech(false);
+        setMicStatusHint("⚡ Sending to Omni-Bot...");
+        updateTelemetry({ volume: 0 }, true);
+      }
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+    window.addEventListener("keyup", handleKeyUp);
+    return () => {
+      window.removeEventListener("keydown", handleKeyDown);
+      window.removeEventListener("keyup", handleKeyUp);
+    };
+  }, [updateTelemetry]);
 
   const moods: EyeMood[] = [
     "normal",
@@ -1702,6 +2185,18 @@ export default function OmniBotMissionControl() {
               </h1>
               <span className="text-[11px] font-mono font-bold px-2.5 py-0.5 rounded-md bg-sky-500/15 text-sky-300 border border-sky-500/30">
                 {wsConnected ? "ESP32:ONLINE" : "ESP32:OFFLINE"}
+                <button
+                  onClick={connectUsbSerial}
+                  className={`text-[11px] font-mono font-extrabold px-3 py-1 rounded-md border transition cursor-pointer ${
+                    usbConnected
+                      ? "bg-emerald-500 text-slate-950 border-emerald-400 shadow-[0_0_12px_#34d399]"
+                      : "bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 border-amber-500/50"
+                  }`}
+                >
+                  {usbConnected
+                    ? "🔌 USB:LOCKED (0ms)"
+                    : "🔌 CONNECT USB CABLE"}
+                </button>
               </span>
               {isAngryMode && (
                 <span className="text-[11px] font-mono font-extrabold px-2.5 py-0.5 rounded-md bg-rose-600 text-white shadow-[0_0_14px_#f43f5e]">
@@ -2186,23 +2681,80 @@ export default function OmniBotMissionControl() {
                 </button>
 
                 {/* Live Hardware Audio Level Bar */}
-                <div className="flex items-center gap-2.5 px-1">
-                  <div className="w-32 h-2 bg-slate-950 rounded-full overflow-hidden border border-slate-800">
+                <div className="bg-slate-950 border border-slate-800 rounded-xl p-2.5 space-y-2">
+                  <div className="flex items-center justify-between text-[11px] font-mono">
+                    <span
+                      className={`font-bold ${
+                        isRecordingSpeech
+                          ? "text-emerald-400 animate-pulse"
+                          : isThinking
+                            ? "text-amber-400"
+                            : isSpeaking
+                              ? "text-sky-400"
+                              : "text-slate-400"
+                      }`}
+                    >
+                      {isRecordingSpeech
+                        ? "● VOICE LOCKED (LISTENING)"
+                        : isThinking
+                          ? "⚡ PROCESSING..."
+                          : isSpeaking
+                            ? "🔊 OMNI SPEAKING"
+                            : micStatusHint}
+                    </span>
+                    <span className="text-slate-400">
+                      HOLD <strong className="text-sky-300">[SPACE]</strong> FOR
+                      INSTANT SEND
+                    </span>
+                  </div>
+
+                  {/* Live Volume Bar with Red Noise-Gate Marker */}
+                  <div className="relative w-full h-3 bg-slate-900 rounded-full overflow-hidden border border-slate-800">
                     <div
                       className={`h-full transition-all duration-75 ${
-                        micVolumeLevel >= 18
-                          ? "bg-emerald-400"
-                          : "bg-sky-500/50"
+                        micVolumeLevel >= noiseThreshold
+                          ? "bg-emerald-400 shadow-[0_0_10px_#34d399]"
+                          : "bg-sky-500/40"
                       }`}
                       style={{ width: `${micVolumeLevel}%` }}
                     />
+                    <div
+                      className="absolute top-0 bottom-0 w-0.5 bg-rose-500"
+                      style={{ left: `${noiseThreshold}%` }}
+                      title="Noise Gate Threshold"
+                    />
                   </div>
-                  <span className="text-[11px] font-mono text-slate-400 truncate">
-                    {micStatusHint}
-                  </span>
+
+                  {/* Exhibition Crowd Noise Gate Slider */}
+                  <div className="flex items-center justify-between gap-3 text-[11px] font-mono text-slate-400">
+                    <span>CROWD NOISE GATE: {noiseThreshold}%</span>
+                    <input
+                      type="range"
+                      min={10}
+                      max={70}
+                      value={noiseThreshold}
+                      onChange={(e) =>
+                        setNoiseThreshold(Number(e.target.value))
+                      }
+                      className="w-36 accent-rose-500 cursor-pointer"
+                    />
+                  </div>
                 </div>
               </div>
-
+              <div className="px-3 py-2 rounded-lg bg-slate-900/90 border border-slate-700/80 min-h-[38px] flex items-center justify-between gap-2">
+                <span className="text-[11px] font-mono uppercase tracking-wider text-slate-400 shrink-0">
+                  Live Transcript:
+                </span>
+                <span
+                  className={`text-xs font-medium truncate ${
+                    liveTranscript
+                      ? "text-emerald-300"
+                      : "text-slate-500 italic"
+                  }`}
+                >
+                  {liveTranscript || "Waiting for speech..."}
+                </span>
+              </div>
               <div className="flex flex-wrap gap-1.5 pt-1">
                 {[
                   {
